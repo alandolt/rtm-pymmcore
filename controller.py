@@ -18,8 +18,9 @@ import numpy as np
 from dmd import DMD
 import threading
 import pandas as pd
-import matplotlib.pyplot as plt
 import time
+import tifffile
+import os
 
 """Simple simulator demonstrating event-driven acquisitions with pymmcore-plus.
     Queue pattern from Kyle M. Douglass: https://gist.github.com/kmdouglass/d15a0410d54d6b12df8614b404d9b751
@@ -51,7 +52,6 @@ class Analyzer:
             store_img(img, metadata, "stim")
         # TODO remove print statement and return something useful
         return {"result": "STOP"}
-
 
 class Controller:
     STOP_EVENT = object()
@@ -189,8 +189,6 @@ class Controller:
                                 )  # TODO: Not really a good idea, but timeout is also not good, as
                                 # the queue fills up already much in advance of the actual acquisition for optofgfr experiments without constant stimming.
                                 # best would be to either slow down the iteration through the dataframe, or give error masks, or something else
-                                import matplotlib.pyplot as plt
-
                                 if np.all(stim_mask == 1):
                                     stim_mask = True
                                 else:
@@ -255,3 +253,20 @@ class Controller:
             self._queue.put(self.STOP_EVENT)
             while self._queue.qsize() > 0:
                 time.sleep(1)
+
+class ControllerSimulated(Controller): 
+    def __init__(self, analyzer, mmc, queue, dmd=None, project_patah=None):
+        super().__init__(analyzer, mmc, queue, dmd)
+        self._project_path = project_patah
+
+    def _on_frame_ready(self, img: np.ndarray, event: MDAEvent) -> None:
+        # Analyze the image+
+        self._frame_buffer.append(img)
+        # check if it's the last acquisition for this MDAsequence
+        if event.metadata["last_channel"]:
+            event.metadata["img_type"] = ImgType.IMG_RAW
+            fname = event.metadata["fname"]
+            frame_complete = tifffile.imread(
+                os.path.join(self._project_path, "raw", fname + ".tiff")
+                )
+            self._results = self._analyzer.run(frame_complete, event)
