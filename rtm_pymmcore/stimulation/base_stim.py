@@ -2,7 +2,6 @@ import numpy as np
 import numpy.typing as npt
 from skimage.draw import disk
 from skimage.measure import regionprops
-from fov import FOV
 
 
 # TODO return also labels_stim, list in which the stimulated cells are marked

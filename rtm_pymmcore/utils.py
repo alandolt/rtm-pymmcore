@@ -1,26 +1,9 @@
 from typing import TypedDict
-import enum
-from fov import FOV
 import numpy as np
 import os
 from skimage.util import map_array
 import lzma
 import pandas as pd
-
-
-class ImgType(enum.Enum):
-    IMG_RAW = enum.auto()
-    IMG_STIM = enum.auto()
-
-
-class MetadataDict(TypedDict):
-    fov: FOV
-    img_type: ImgType
-    last_channel: str
-    stim_mask: np.array
-    timestep: int
-    time: int
-    fname: str
 
 
 def create_folders(path, folders):
