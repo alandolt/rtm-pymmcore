@@ -4,14 +4,17 @@ import enum
 import numpy as np
 import pandas as pd
 
-@dataclass
-class Fov: 
-    index: int
-    light_mask: np.ndarray = None
-    stim_mask_queue: queue.SimpleQueue = queue.SimpleQueue()
-    tracks_queue: queue.SimpleQueue = queue.SimpleQueue()
-    tracks: pd.DataFrame = None
-    linker: object = None
+
+class Fov:
+    def __init__(self, index: int):
+        self.index = index
+        self.stim_mask = None
+        self.light_mask = None
+        self.stim_mask_queue = queue.SimpleQueue()
+        self.tracks_queue = queue.SimpleQueue()
+        self.tracks = None
+        self.linker = None
+
 
 @dataclass
 class Channel:
@@ -21,7 +24,7 @@ class Channel:
     power: int = None
     device_name: str = None
     property_name: str = None
-    
+
 
 @dataclass
 class StimChannel:
@@ -30,6 +33,7 @@ class StimChannel:
     power: int = None
     device_name: str = None
     power_property_name: str = None
+
 
 @dataclass
 class StimTreatment:
@@ -43,6 +47,7 @@ class StimTreatment:
     stim_property = None
     stim_property_value = None
 
-class ImgType(enum.Enum): 
+
+class ImgType(enum.Enum):
     IMG_RAW = enum.auto()
     IMG_STIM = enum.auto()

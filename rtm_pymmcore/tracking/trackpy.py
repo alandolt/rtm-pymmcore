@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from .base_tracker import Tracker
+from rtm_pymmcore.tracking.base_tracker import Tracker
 import trackpy
 
 
@@ -25,9 +25,6 @@ class TrackerTrackpy(Tracker):
             raise ValueError(f"Missing required columns: {missing_columns}")
 
         fov = metadata["fov_object"]
-        df_new["frame"] = metadata["timestep"]
-        df_new["time"] = metadata["time"]
-        df_new["fname"] = metadata["fname"]
 
         coordinates = np.array(
             df_new[["x", "y"]]
@@ -56,6 +53,6 @@ class TrackerTrackpy(Tracker):
             df_tracked = pd.concat([df_old, df_new])
 
         # this is against a in trackpy, where the same ID gets assigned twice in one frame
-        df_tracked = df_tracked.drop_duplicates(subset=["particle", "frame"])
+        df_tracked = df_tracked.drop_duplicates(subset=["particle", "timestep"])
         df_tracked = df_tracked.reset_index(drop=True)
         return df_tracked

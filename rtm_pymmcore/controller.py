@@ -1,5 +1,5 @@
 from pymmcore_plus import CMMCorePlus
-from rtm_pymmcore.add_frame import store_img, ImageProcessingPipeline
+from rtm_pymmcore.img_processing_pip import store_img, ImageProcessingPipeline
 from rtm_pymmcore.data_structures import Fov, ImgType
 from rtm_pymmcore.dmd import DMD
 
@@ -38,7 +38,6 @@ class Analyzer:
         if img_type == ImgType.IMG_STIM:
             # stim image, store
             store_img(img, metadata, self.pipeline.storage_path, "stim")
-        # TODO remove print statement and return something useful
         return {"result": "STOP"}
 
 
@@ -115,8 +114,8 @@ class Controller:
                         )
                         self._queue.put(acquisition_event)
 
-                    if timestep > 0:
-                        fov_obj.tracks = fov_obj.tracks_queue.get(block=True)
+                    # if timestep > 0:
+                    #     fov_obj.tracks = fov_obj.tracks_queue.get(block=True)
                     metadata_dict = dict(row)
                     metadata_dict["img_type"] = ImgType.IMG_RAW
                     metadata_dict["last_channel"] = channels[-1]
@@ -125,8 +124,6 @@ class Controller:
                     for i, channel_i in enumerate(channels):
                         last_channel: bool = i == len(channels) - 1
                         metadata_dict["last_channel"] = last_channel
-                        metadata_dict["channel"] = channel_i
-                        print(channel_i)
                         power_prop = (
                             channel_i.get("device_name", None),
                             channel_i.get("property_name", None),
@@ -163,7 +160,6 @@ class Controller:
                     if stim:
                         metadata_dict["img_type"] = ImgType.IMG_STIM
                         metadata_dict["last_channel"] = True
-                        row.get("stim_channel_name")
 
                         power_prop = (
                             row["stim_channel_device_name"],

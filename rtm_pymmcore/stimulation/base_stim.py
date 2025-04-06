@@ -12,7 +12,7 @@ class Stim:
     """
 
     def get_stim_mask(
-        self, label_image: np.ndarray, metadata: dict, img: np.ndarray
+        self, label_images: dict, metadata: dict, img: np.ndarray
     ) -> npt.NDArray[np.uint8]:
         """
         Parameters:
@@ -31,9 +31,9 @@ class StimWholeFOV(Stim):
     """
 
     def get_stim_mask(
-        self, label_image: np.ndarray, metadata: dict = None, img: np.array = None
+        self, label_images: dict, metadata: dict = None, img: np.array = None
     ) -> npt.NDArray[np.uint8]:
-        return np.ones_like(label_image), [1, 2, 3, 4]  # some dummy values
+        return np.ones((img.shape[-2], img.shape[-1]), dtype=np.uint8), None
 
 
 class StimNothing(Stim):

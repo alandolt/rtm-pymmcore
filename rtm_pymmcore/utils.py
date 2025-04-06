@@ -28,7 +28,7 @@ def labels_to_particles(labels, tracks):
     # For every frame
     # labels_stack = np.array(labels_stack)
     particles = np.zeros_like(labels)
-    tracks_f = tracks[(tracks["frame"] == tracks.frame.max())]
+    tracks_f = tracks[(tracks["timestep"] == tracks.timestep.max())]
     # particle_f = np.zeros((1024,1024))
     from_label = tracks_f["label"].values
     to_particle = tracks_f["particle"].values
