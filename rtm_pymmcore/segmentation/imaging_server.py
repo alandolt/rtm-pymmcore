@@ -1,5 +1,5 @@
 import numpy as np
-from .base_segmentator import Segmentator
+from .base_segmentation import Segmentator
 import skimage
 import imaging_server_kit
 

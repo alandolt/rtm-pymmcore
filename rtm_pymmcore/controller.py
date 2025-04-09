@@ -30,9 +30,8 @@ class Analyzer:
         if img_type == ImgType.IMG_RAW:
             # raw image, send to pipeline and store
             if self.pipeline is not None:
-                self.pipeline.run(img, event)
-                # thread = threading.Thread(target=self.pipeline.run, args=(img, event))
-                # thread.start()
+                thread = threading.Thread(target=self.pipeline.run, args=(img, event))
+                thread.start()
             store_img(img, metadata, self.pipeline.storage_path, "raw")
 
         if img_type == ImgType.IMG_STIM:
@@ -99,7 +98,16 @@ class Controller:
                     event_start_time = float(row["time"])
 
                     channels = row["channels"]
-                    stim = row["stim"]
+
+                    metadata_dict = dict(row)
+                    metadata_dict["img_type"] = ImgType.IMG_RAW
+                    metadata_dict["last_channel"] = channels[-1]
+
+                    if "stim" not in df_acquire.columns:
+                        stim = False
+                        metadata_dict["stim"] = False
+                    else:
+                        stim = row["stim"]
 
                     if self.use_autofocus_event:
                         acquisition_event = useq.MDAEvent(
@@ -116,9 +124,6 @@ class Controller:
 
                     # if timestep > 0:
                     #     fov_obj.tracks = fov_obj.tracks_queue.get(block=True)
-                    metadata_dict = dict(row)
-                    metadata_dict["img_type"] = ImgType.IMG_RAW
-                    metadata_dict["last_channel"] = channels[-1]
 
                     ### Capture the raw image without DMD illumination
                     for i, channel_i in enumerate(channels):

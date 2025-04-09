@@ -8,12 +8,12 @@ import pandas as pd
 import tifffile
 from useq import MDAEvent
 
-import rtm_pymmcore.segmentation.base_segmentator as base_segmentator
-import rtm_pymmcore.stimulation.base_stim as base_stim
-import rtm_pymmcore.tracking.base_tracker as base_tracker
-import rtm_pymmcore.feature_extraction.base_feature_extractor as base_feature_extractor
+import rtm_pymmcore.segmentation.base_segmentation as base_segmentation
+import rtm_pymmcore.stimulation.base_stimulation as base_stimulation
+import rtm_pymmcore.tracking.abstract_tracker as abstract_tracker
+import rtm_pymmcore.feature_extraction.abstract_fe as abstract_fe
 from rtm_pymmcore.data_structures import Fov, ImgType
-from rtm_pymmcore.utils import labels_to_particles
+from rtm_pymmcore.utils import labels_to_particles, create_folders
 
 
 def store_img(img: np.array, metadata, path: str, folder: str):
@@ -33,16 +33,28 @@ class ImageProcessingPipeline:
     def __init__(
         self,
         storage_path: str,
-        segmentators: List[base_segmentator.Segmentator] = None,
-        feature_extractor: base_feature_extractor.FeatureExtractor = None,
-        stimulator: base_stim.Stim = None,
-        tracker: base_tracker.Tracker = None,
+        segmentators: List[base_segmentation.Segmentator] = None,
+        feature_extractor: abstract_fe.FeatureExtractor = None,
+        stimulator: base_stimulation.Stim = None,
+        tracker: abstract_tracker.Tracker = None,
     ):
         self.segmentators = segmentators
         self.feature_extractor = feature_extractor
         self.stimulator = stimulator
         self.tracker = tracker
         self.storage_path = storage_path
+        folders = ["raw", "tracks"]
+        if self.stimulator is not None:
+            folders.extend(["stim_mask", "stim"])
+        if self.tracker is not None:
+            folders.append("particles")
+        if self.feature_extractor is not None:
+            if hasattr(self.feature_extractor, "extra_folders"):
+                folders.extend(self.feature_extractor.extra_folders)
+        if self.segmentators is not None:
+            for seg in self.segmentators:
+                folders.append(seg["name"])
+        create_folders(self.storage_path, folders)
 
     def run(self, img: np.ndarray, event: MDAEvent) -> dict:
         """
@@ -181,7 +193,8 @@ class ImageProcessingPipeline:
             ):
                 if segmentator.get("save_tracked", False):
                     tracked_label = labels_to_particles(value, df_tracked)
-                    store_img(tracked_label, metadata, self.storage_path, key)
+                    store_img(tracked_label, metadata, self.storage_path, "particles")
+                    store_img(value, metadata, self.storage_path, key)
                 else:
                     store_img(value, metadata, self.storage_path, key)
 

@@ -1,7 +1,6 @@
 import numpy as np
-from .base_segmentator import Segmentator
+from rtm_pymmcore.segmentation.base_segmentation import Segmentator
 import skimage
-
 import csbdeep
 from stardist.models import StarDist2D
 import matplotlib.pyplot as plt
@@ -47,10 +46,6 @@ class SegmentatorStardist(Segmentator):
         """
         Run the stardist model on data and do post-processing (remove small cells)
         """
-        # TODO: Warning for first image from tenserflow:
-        # functional.py (237): The structure of `inputs` doesn't match the expected structure.
-        # Expected: ['input']
-        # Received: inputs=Tensor(shape=(1, 1904, 1904, 1))
         img_normed = csbdeep.utils.normalize(img, self.norm_min, self.norm_max)
         if self.prob_thresh is None:
             labels, details = self.model.predict_instances(img_normed)

@@ -34,20 +34,3 @@ def labels_to_particles(labels, tracks):
     to_particle = tracks_f["particle"].values
     particles = map_array(labels, from_label, to_particle, out=particles)
     return particles
-
-
-def write_compressed_pickle(data: pd.DataFrame, filename: str) -> None:
-    """Writes a compressed pickle file. Uses Lzma as compression algorithm. File extension will be added automatically (.xz)"""
-    if not filename.endswith(".xz"):
-        filename = filename + ".xz"
-    with lzma.open(filename, "wb") as f:
-        pd.to_pickle(data, f)
-
-
-def read_compressed_pickle(filename: str) -> pd.DataFrame:
-    """Reads a compressed pickle file that uses Lzma as compression algorithm. File extension will be added automatically (.xz)"""
-    if not filename.endswith(".xz"):
-        filename = filename + ".xz"
-    with lzma.open(filename, "rb") as f:
-        data = pd.read_pickle(f)
-    return data
