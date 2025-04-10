@@ -170,19 +170,24 @@ class ImageProcessingPipeline:
             os.path.join(self.storage_path, "tracks", f"{metadata['fname']}.parquet")
         )
 
-        if metadata["stim"]:
-            store_img(stim_mask, metadata, self.storage_path, "stim_mask")
-        else:
-            store_img(
-                np.zeros(shape_img, np.uint8), metadata, self.storage_path, "stim_mask"
-            )
-            store_img(
-                np.zeros(shape_img, np.uint8), metadata, self.storage_path, "stim"
-            )
+        if self.stimulator is not None:
+            if metadata["stim"]:
+                store_img(stim_mask, metadata, self.storage_path, "stim_mask")
+            else:
+                store_img(
+                    np.zeros(shape_img, np.uint8),
+                    metadata,
+                    self.storage_path,
+                    "stim_mask",
+                )
+                store_img(
+                    np.zeros(shape_img, np.uint8), metadata, self.storage_path, "stim"
+                )
 
         if masks_for_fe is not None:
-            for key, value in masks_for_fe.items():
-                store_img(value, metadata, self.storage_path, key)
+            for mask_fe in masks_for_fe:
+                for key, value in mask_fe.items():
+                    store_img(value, metadata, self.storage_path, key)
 
         if self.tracker is None:
             for key, value in segmentation_results.items():
