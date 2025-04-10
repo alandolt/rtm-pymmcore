@@ -18,7 +18,9 @@ class StimPercentageOfCell(Stim):
         xp = v1[0] * v2[1] - v1[1] * v2[0]
         return xp > 0
 
-    def get_stim_mask(self, label_images, metadata: dict = None, img: np.array = None) -> np.ndarray:
+    def get_stim_mask(
+        self, label_images, metadata: dict = None, img: np.array = None
+    ) -> np.ndarray:
         label_image = label_images["labels"]
         light_map = np.zeros_like(label_image, dtype=bool)
         props = skimage.measure.regionprops(label_image)
@@ -30,7 +32,7 @@ class StimPercentageOfCell(Stim):
             extent = 0.5 - percentage_of_stim
             # Koordinaten-Arrays einmal erstellen für bessere Performance
             y_coords, x_coords = np.indices(label_image.shape)
-            
+
             for prop in props:
                 label = prop.label
                 single_label = label_image == label
@@ -47,11 +49,11 @@ class StimPercentageOfCell(Stim):
                 x3 = x2 + (length * math.cos(-orientation))
                 y3 = y2 + (length * math.sin(-orientation))
 
-                v1_x = x3 - x2  
+                v1_x = x3 - x2
                 v1_y = y3 - y2
-                v2_x = x3 - x_coords  
+                v2_x = x3 - x_coords
                 v2_y = y3 - y_coords
-                
+
                 cross_product = v1_x * v2_y - v1_y * v2_x
                 cutoff_mask = cross_product > 0
 
@@ -61,7 +63,7 @@ class StimPercentageOfCell(Stim):
                 stim_mask = np.logical_and(cutoff_mask, frame_labeled_expanded)
 
                 light_map = np.logical_or(light_map, stim_mask)
-                
+
             return light_map.astype("uint8"), None
         except Exception as e:
             print(e)
