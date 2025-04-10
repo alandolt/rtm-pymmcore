@@ -168,7 +168,7 @@ class Controller:
 
                         power_prop = (
                             row["stim_channel_device_name"],
-                            row["stim_channel_power_property"],
+                            row["stim_channel_power_property_name"],
                             row["stim_power"],
                         )
                         if any(el is None for el in power_prop):
