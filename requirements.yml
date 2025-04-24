@@ -15,7 +15,7 @@ dependencies:
   - pyqt
   - tifffile
   - pip
-  - pip: 
+  - pip:
     - pymmcore-plus
     - pymmcore-widgets
     - tensorflow

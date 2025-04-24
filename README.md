@@ -49,7 +49,7 @@ The image processing pipeline is designed with modularity in mind. Each step is 
 
 * **Image Segmentation:**
     * This step focuses on identifying and delineating individual cells within the acquired images.
-    * The desired segmentation engine(s) and their specific parameters are configured in the Jupyter notebook using a list of dictionaries. 
+    * The desired segmentation engine(s) and their specific parameters are configured in the Jupyter notebook using a list of dictionaries.
     ```python
     # Example of a segmentation engine configuration
     segmentators = [
@@ -71,11 +71,11 @@ The image processing pipeline is designed with modularity in mind. Each step is 
 * **Stimulation Engine:**
     * This optional step allows for applying targeted stimulation based on the segmentation results.
     * It can utilize a Digital Micromirror Device (DMD) for structured illumination, enabling stimulation of specific cells or regions defined by the segmentation masks.
-    * Alternatively, if no DMD is available, full field of view stimulation will be performed. 
+    * Alternatively, if no DMD is available, full field of view stimulation will be performed.
     * The stimulation mask generated from the segmentation is sent to the DMD or microscope control system to apply the desired stimulation pattern.
 
     ```python
-    stimulator = StimPercentageOfCell() 
+    stimulator = StimPercentageOfCell()
     ```
 
 * **Feature Extraction:**
@@ -157,4 +157,3 @@ Contributions to this repository are welcome. Please feel free to submit pull re
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for more details.
-

@@ -14,5 +14,5 @@ dependencies:
   - ipykernel
   - opencv
   - pip
-  - pip: 
+  - pip:
     - napari-timestamper
