@@ -51,3 +51,4 @@ class StimTreatment:
 class ImgType(enum.Enum):
     IMG_RAW = enum.auto()
     IMG_STIM = enum.auto()
+    IMG_OPTOCHECK = enum.auto()

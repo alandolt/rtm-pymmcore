@@ -34,9 +34,20 @@ class Analyzer:
                 thread.start()
             store_img(img, metadata, self.pipeline.storage_path, "raw")
 
-        if img_type == ImgType.IMG_STIM:
+        elif img_type == ImgType.IMG_STIM:
             # stim image, store
             store_img(img, metadata, self.pipeline.storage_path, "stim")
+
+        elif img_type == ImgType.IMG_OPTOCHECK:
+            # on one side store image as normal raw, but also send a copy to optocheck pipeline
+            # raw image, send to pipeline and store
+            len_raw_img = len(metadata["channels"])
+            if self.pipeline is not None:
+                thread = threading.Thread(target=self.pipeline.run, args=(img, event))
+                thread.start()
+            store_img(img[0:len_raw_img], metadata, self.pipeline.storage_path, "raw")
+            store_img(img, metadata, self.pipeline.storage_path, "optocheck")
+
         return {"result": "STOP"}
 
 
@@ -109,6 +120,12 @@ class Controller:
                     else:
                         stim = row["stim"]
 
+                    if "optocheck" not in df_acquire.columns:
+                        optocheck = False
+                        metadata_dict["optocheck"] = False
+                    else:
+                        optocheck = row["optocheck"]
+
                     if self.use_autofocus_event:
                         acquisition_event = useq.MDAEvent(
                             index={"t": timestep, "c": 0, "p": fov_index},
@@ -125,10 +142,11 @@ class Controller:
                     # if timestep > 0:
                     #     fov_obj.tracks = fov_obj.tracks_queue.get(block=True)
 
-                    ### Capture the raw image without DMD illumination
                     for i, channel_i in enumerate(channels):
-                        last_channel: bool = i == len(channels) - 1
-                        metadata_dict["last_channel"] = last_channel
+                        metadata_dict["last_channel"] = False
+                        if not optocheck:
+                            last_channel: bool = i == len(channels) - 1
+                            metadata_dict["last_channel"] = last_channel
                         power_prop = (
                             channel_i.get("device_name", None),
                             channel_i.get("property_name", None),
@@ -161,6 +179,47 @@ class Controller:
                         )
                         # add the event to the acquisition queue
                         self._queue.put(acquisition_event)
+
+                    if optocheck:
+                        metadata_dict["img_type"] = ImgType.IMG_OPTOCHECK
+
+                        for i, optocheck_ch in enumerate(row["optocheck_channels"]):
+                            last_channel: bool = i == len(row["optocheck_channels"]) - 1
+                            metadata_dict["last_channel"] = last_channel
+
+                            power_prop = (
+                                optocheck_ch.get("device_name", None),
+                                optocheck_ch.get("property_name", None),
+                                optocheck_ch.get("power", None),
+                            )
+                            if any(el is None for el in power_prop):
+                                power_prop = None
+
+                            acquisition_event = useq.MDAEvent(
+                                index={
+                                    "t": timestep,
+                                    "c": i,
+                                    "p": fov_index,
+                                },  # the index of the event in the sequence
+                                channel={
+                                    "config": optocheck_ch["name"],
+                                    "group": (
+                                        optocheck_ch["group"]
+                                        if optocheck_ch["group"] is not None
+                                        else self._current_group
+                                    ),
+                                },
+                                metadata=metadata_dict,
+                                x_pos=fov_x,
+                                y_pos=fov_y,
+                                z_pos=fov_z,
+                                min_start_time=event_start_time,
+                                exposure=optocheck_ch.get("exposure", None),
+                                properties=(
+                                    [power_prop] if power_prop is not None else None
+                                ),
+                            )
+                            self._queue.put(acquisition_event)
 
                     if stim:
                         metadata_dict["img_type"] = ImgType.IMG_STIM
@@ -234,13 +293,15 @@ class ControllerSimulated(Controller):
         self._project_path = project_path
 
     def _on_frame_ready(self, img: np.ndarray, event: MDAEvent) -> None:
-        # Analyze the image+
-        self._frame_buffer.append(img)
-        # check if it's the last acquisition for this MDAsequence
         if event.metadata["last_channel"]:
-            event.metadata["img_type"] = ImgType.IMG_RAW
             fname = event.metadata["fname"]
-            frame_complete = tifffile.imread(
-                os.path.join(self._project_path, "raw", fname + ".tiff")
-            )
-            self._results = self._analyzer.run(frame_complete, event)
+            if event.metadata["img_type"] == ImgType.IMG_RAW:
+                frame_complete = tifffile.imread(
+                    os.path.join(self._project_path, "raw", fname + ".tiff")
+                )
+                self._results = self._analyzer.run(frame_complete, event)
+            elif event.metadata["img_type"] == ImgType.IMG_OPTOCHECK:
+                frame_complete = tifffile.imread(
+                    os.path.join(self._project_path, "optocheck", fname + ".tiff")
+                )
+                self._results = self._analyzer.run(frame_complete, event)

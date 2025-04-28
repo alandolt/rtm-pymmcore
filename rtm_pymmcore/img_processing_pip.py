@@ -37,11 +37,13 @@ class ImageProcessingPipeline:
         feature_extractor: abstract_fe.FeatureExtractor = None,
         stimulator: base_stimulation.Stim = None,
         tracker: abstract_tracker.Tracker = None,
+        feature_extractor_optocheck: abstract_fe.FeatureExtractor = None,
     ):
         self.segmentators = segmentators
         self.feature_extractor = feature_extractor
         self.stimulator = stimulator
         self.tracker = tracker
+        self.feature_extractor_optocheck = feature_extractor_optocheck
         self.storage_path = storage_path
         folders = ["raw", "tracks"]
         if self.stimulator is not None:
@@ -54,6 +56,10 @@ class ImageProcessingPipeline:
         if self.segmentators is not None:
             for seg in self.segmentators:
                 folders.append(seg["name"])
+        if feature_extractor_optocheck is not None:
+            folders.append("optocheck")
+            if hasattr(feature_extractor_optocheck, "extra_folders"):
+                folders.extend(feature_extractor_optocheck.extra_folders)
         create_folders(self.storage_path, folders)
 
     def run(self, img: np.ndarray, event: MDAEvent) -> dict:
@@ -88,6 +94,12 @@ class ImageProcessingPipeline:
             df_old = fov_obj.tracks_queue.get(block=True, timeout=360)
         else:
             df_old = pd.DataFrame()
+
+        if metadata["img_type"] == ImgType.IMG_OPTOCHECK:
+            n_optocheck_channels = len(metadata["optocheck_channels"])
+            n_channels = len(metadata["channels"])
+            img_optocheck = img[n_channels:]
+            img = img[:n_channels]
 
         shape_img = (img.shape[-2], img.shape[-1])
 
@@ -133,6 +145,14 @@ class ImageProcessingPipeline:
         else:
             df_tracked = pd.concat([df_old, df_new], ignore_index=True)
 
+        if metadata["img_type"] == ImgType.IMG_OPTOCHECK:
+            if (
+                self.feature_extractor_optocheck is not None
+                and self.tracker is not None
+            ):
+                df_tracked = self.feature_extractor_optocheck.extract_features(
+                    segmentation_results, img_optocheck, df_tracked
+                )
         fov_obj.tracks_queue.put(df_tracked)
 
         if not df_tracked.empty:
@@ -164,7 +184,6 @@ class ImageProcessingPipeline:
         except ValueError as e:
             print(e)
             print("Error in converting datatypes. df_tracked:")
-            print(df_tracked)
 
         df_tracked.to_parquet(
             os.path.join(self.storage_path, "tracks", f"{metadata['fname']}.parquet")
