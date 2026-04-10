@@ -152,6 +152,9 @@ class ComposedAgent(InterPhaseAgent):
                     pre_results.append(result)
                     if "positions" in result:
                         fov_positions = result["positions"]
+                elif isinstance(result, list):
+                    # Bare list-of-positions return (e.g. FOVFinderAgent).
+                    fov_positions = result
 
             if not self.pre_phase_agents:
                 # No pre-phase agents — call inner without positions; it
@@ -194,6 +197,9 @@ class ComposedAgent(InterPhaseAgent):
                 pre_results.append(result)
                 if "positions" in result:
                     pre_positions = result["positions"]
+            elif isinstance(result, list):
+                # Bare list-of-positions return (e.g. FOVFinderAgent).
+                pre_positions = result
 
         positions = pre_positions if pre_positions is not None else fov_positions
         inner_result = self.inner_agent.run_one_phase(

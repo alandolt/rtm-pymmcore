@@ -40,6 +40,15 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     def cancel_mda(self):
         self.mmc.mda.cancel()
 
+    def get_focus(self) -> float | None:
+        """Read the current focus device position (µm) via pymmcore-plus."""
+        if self.mmc is None:
+            return None
+        try:
+            return float(self.mmc.getPosition())
+        except Exception:
+            return None
+
     def resolve_group(self, config_name: str) -> str:
         """Return the channel group for *config_name*, auto-detecting if needed."""
         if self._current_group is None:
@@ -81,6 +90,7 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         if self.mmc is None:
             return {}
         from faro.core.utils import detect_power_properties
+
         detected = detect_power_properties(self.mmc, group=group)
         self._detected_power_properties = detected
         return detected
@@ -98,4 +108,7 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         if self._detected_power_properties is None:
             self.detect_power_properties()
         from faro.core.utils import validate_hardware
-        return validate_hardware(events, self.mmc, power_properties=self.get_power_properties())
+
+        return validate_hardware(
+            events, self.mmc, power_properties=self.get_power_properties()
+        )
