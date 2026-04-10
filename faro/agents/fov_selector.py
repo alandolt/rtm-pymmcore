@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from rtm_pymmcore.agents.base import PreExperimentAgent
+from faro.agents.base import PreExperimentAgent
 
 if TYPE_CHECKING:
-    from rtm_pymmcore.microscope.base import AbstractMicroscope
-    from rtm_pymmcore.segmentation.base import Segmentator
+    from faro.microscope.base import AbstractMicroscope
+    from faro.segmentation.base import Segmentator
 
 
 class FOVSelectorAgent(PreExperimentAgent):
