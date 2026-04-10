@@ -90,12 +90,19 @@ class InterPhaseAgent(Agent):
         Args:
             fov: FOV index.
             phase_id: If set, reads the phase-specific parquet file.
+
+        Returns:
+            Tracked DataFrame, or empty DataFrame if file not found.
         """
         if phase_id is not None:
             fname = f"{fov}_phase_{phase_id}_latest.parquet"
         else:
             fname = f"{fov}_latest.parquet"
-        return pd.read_parquet(os.path.join(self.storage_path, "tracks", fname))
+        path = os.path.join(self.storage_path, "tracks", fname)
+        try:
+            return pd.read_parquet(path)
+        except FileNotFoundError:
+            return pd.DataFrame()
 
 
 class IntraExperimentAgent(Agent):
