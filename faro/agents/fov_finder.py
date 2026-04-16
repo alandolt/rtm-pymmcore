@@ -391,6 +391,14 @@ class FOVFinderAgent(PreExperimentAgent):
               ``plate_row``, ``plate_col``, ``grid_row``, ``grid_col``)
               and serialise directly to the JSON shape that ``useq``-aware
               tools (e.g. the pymmcore-widgets MDA position list) expect.
+        cycle_wells: If ``True``, the well queue is refilled from the
+            original ``wells`` list when it's exhausted, so more phases
+            can be run than the plate nominally provides (``len(wells)
+            // wells_per_phase``).  The per-phase random seed is
+            phase-dependent, so a well revisited on a later phase still
+            yields fresh candidate FOV positions (not the same ones as
+            the previous pass).  Default ``False`` (raises when empty,
+            preserving the original behaviour).
         verbose: If ``True``, every :meth:`run` call shows debug plots
             via matplotlib: one ``raw | segmentation`` figure per scanned
             candidate (title carries the position name and detected cell
@@ -424,6 +432,7 @@ class FOVFinderAgent(PreExperimentAgent):
         name_prefix: str = "fov",
         strict_count: bool = True,
         return_json: bool | None = None,
+        cycle_wells: bool = False,
         verbose: bool = False,
     ):
         """See class docstring.
@@ -496,6 +505,7 @@ class FOVFinderAgent(PreExperimentAgent):
         self.name_prefix = name_prefix
         self.strict_count = bool(strict_count)
         self.return_json = bool(return_json) if return_json is not None else False
+        self.cycle_wells = bool(cycle_wells)
         self.verbose = bool(verbose)
 
         self._plan = self._load_plan(well_plate_plan)
@@ -511,6 +521,7 @@ class FOVFinderAgent(PreExperimentAgent):
                     f"Well {w!r} is outside the plate "
                     f"({self._plate.rows} rows x {self._plate.columns} cols)"
                 )
+        self._wells_source: list[str] = list(wells)  # kept for cycling
         self._remaining_wells: list[str] = list(wells)
 
         self._phase_index = 0
@@ -589,15 +600,38 @@ class FOVFinderAgent(PreExperimentAgent):
     def pick_next_wells(self, n: int | None = None) -> list[str]:
         """Pop and return the next chunk of wells from the queue.
 
+        If the queue is exhausted and :attr:`cycle_wells` is True, the
+        queue is refilled from the original ``wells`` list so phases
+        beyond the plate's capacity reuse earlier wells (in the same
+        order).  The per-phase random seed is phase-dependent, so even
+        when a well is revisited the candidate FOV positions within it
+        are fresh (not identical to any earlier phase).
+
         Args:
             n: How many wells to pop.  Defaults to ``self.wells_per_phase``.
 
         Raises:
-            RuntimeError: If the well queue is empty.
+            RuntimeError: If the queue is empty and ``cycle_wells`` is False.
         """
         n = self.wells_per_phase if n is None else int(n)
-        if not self._remaining_wells:
-            raise RuntimeError("FOVFinderAgent: out of wells")
+        if len(self._remaining_wells) < n:
+            if self.cycle_wells:
+                # Refill from the original well list, appending to any
+                # leftover from the previous cycle (so the order stays
+                # deterministic across refills).
+                self._remaining_wells = list(self._remaining_wells) + list(
+                    self._wells_source
+                )
+                if self.verbose:
+                    print(
+                        f"[FOVFinderAgent] Well queue refilled from source "
+                        f"({len(self._wells_source)} wells); now {len(self._remaining_wells)} queued."
+                    )
+            else:
+                if not self._remaining_wells:
+                    raise RuntimeError("FOVFinderAgent: out of wells")
+                # Otherwise partial batch — original behaviour below returns
+                # just the remaining wells.
         chosen = self._remaining_wells[:n]
         self._remaining_wells = self._remaining_wells[n:]
         return chosen
@@ -609,7 +643,12 @@ class FOVFinderAgent(PreExperimentAgent):
 
     @property
     def n_remaining_phases(self) -> int:
-        """How many full phases worth of wells are still available."""
+        """How many full phases worth of wells are still available.
+
+        With ``cycle_wells=True``, this reports the number of phases
+        fittable in the CURRENT (possibly partially-consumed) queue;
+        more phases are always available via refilling.
+        """
         return len(self._remaining_wells) // self.wells_per_phase
 
     # ------------------------------------------------------------------
