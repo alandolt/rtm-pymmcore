@@ -1,14 +1,76 @@
 from __future__ import annotations
 
+import operator as _operator
 import os
+import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable
 
 import pandas as pd
 
 if TYPE_CHECKING:
     from faro.core.controller import Controller
     from faro.microscope.base import AbstractMicroscope
+
+# ------------------------------------------------------------------
+# Declarative condition (plug-and-play, like SegmentationMethod)
+# ------------------------------------------------------------------
+
+_OPERATORS: dict[str, Callable[[float, float], bool]] = {
+    "below": _operator.lt,
+    "above": _operator.gt,
+    "below_or_equal": _operator.le,
+    "above_or_equal": _operator.ge,
+    "equal": _operator.eq,
+}
+
+
+@dataclass
+class Condition:
+    """Declarative condition on tracked data.
+
+    Used by :class:`ConditionMonitorAgent` to decide when to trigger a
+    response.  Works like :class:`~faro.core.data_structures.SegmentationMethod`
+    — a small, self-contained description that the framework consumes.
+
+    Args:
+        feature: Column name in ``df_tracked`` to monitor (e.g. ``"cnr"``).
+        operator: Comparison operator — one of ``"below"``, ``"above"``,
+            ``"below_or_equal"``, ``"above_or_equal"``, ``"equal"``.
+        threshold: Value to compare against.
+        aggregation: How to reduce per-cell values to a single number —
+            ``"mean"``, ``"median"``, ``"max"``, ``"min"``, or ``"count"``.
+
+    Example::
+
+        Condition("cnr", "below", 1.0)
+        Condition("area", "above", 500, aggregation="max")
+    """
+
+    feature: str
+    operator: str
+    threshold: float
+    aggregation: str = "mean"
+
+    def __post_init__(self) -> None:
+        if self.operator not in _OPERATORS:
+            raise ValueError(
+                f"Unknown operator {self.operator!r}; "
+                f"choose from {list(_OPERATORS)}"
+            )
+
+    def check(self, df: pd.DataFrame) -> bool:
+        """Return True when the condition is met on the latest timestep."""
+        if df.empty or self.feature not in df.columns:
+            return False
+        latest_t = df["timestep"].max()
+        latest_rows = df[df["timestep"] == latest_t]
+        series = latest_rows[self.feature].dropna()
+        if series.empty:
+            return False
+        value = getattr(series, self.aggregation)()
+        return _OPERATORS[self.operator](value, self.threshold)
 
 
 class Agent(ABC):
@@ -148,6 +210,31 @@ class InterPhaseAgent(Agent):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement run_one_phase(); "
             "override it to make this agent composable."
+        )
+
+    def _wait_for_pipeline(self, timeout: float = 120) -> None:
+        """Block until the Analyzer has drained its queues.
+
+        Safe to call after ``controller.run_experiment()`` or
+        ``controller.continue_experiment()`` to ensure all frames have
+        been processed before reading results.
+        """
+        analyzer = self.controller._analyzer
+        if analyzer is None:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if (
+                analyzer._storage_queue.qsize() == 0
+                and analyzer._deferred_queue.qsize() == 0
+            ):
+                with analyzer.task_lock:
+                    if analyzer.active_pipeline_tasks == 0:
+                        return
+            time.sleep(0.5)
+        print(
+            f"[{type(self).__name__}] Warning: "
+            f"_wait_for_pipeline timed out after {timeout}s"
         )
 
 

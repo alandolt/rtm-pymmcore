@@ -16,7 +16,9 @@ multi-phase experiments where each phase visits a fresh batch of wells.
 
 from __future__ import annotations
 
+import operator as _operator
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -26,6 +28,80 @@ import pandas as pd
 from faro.agents.base import PreExperimentAgent
 from faro.core.data_structures import Channel, RTMSequence
 from faro.core.utils import FovPosition
+
+_FOV_OPERATORS: dict[str, Any] = {
+    "below": _operator.lt,
+    "above": _operator.gt,
+    "below_or_equal": _operator.le,
+    "above_or_equal": _operator.ge,
+    "equal": _operator.eq,
+}
+
+
+@dataclass
+class FOVCondition:
+    """Condition for filtering FOVs based on per-cell features.
+
+    Evaluates whether a sufficient fraction of cells in an FOV satisfy a
+    threshold on a given feature.  This allows feature-aware FOV selection
+    beyond simple cell-count filtering — e.g. selecting only FOVs where
+    the biosensor signal is in a usable range.
+
+    Requires a :class:`~faro.feature_extraction.base.FeatureExtractor`
+    that produces the referenced feature column (e.g.
+    :class:`~faro.feature_extraction.erk_ktr.FE_ErkKtr` for ``"cnr"``).
+
+    Args:
+        feature: Column name in the per-cell feature table produced by
+            ``FeatureExtractor.extract_features()`` (e.g. ``"cnr"``).
+        operator: Comparison — ``"below"``, ``"above"``,
+            ``"below_or_equal"``, ``"above_or_equal"``, ``"equal"``.
+        threshold: Value to compare against.
+        min_fraction: Minimum fraction of cells that must satisfy the
+            condition for the FOV to be accepted.  Default ``1.0``
+            (every cell must satisfy).
+
+    Example::
+
+        # Accept FOVs where at least 80 % of cells have CNR < 0.6
+        FOVCondition("cnr", "below", 0.6, min_fraction=0.8)
+    """
+
+    feature: str
+    operator: str
+    threshold: float
+    min_fraction: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.operator not in _FOV_OPERATORS:
+            raise ValueError(
+                f"Unknown operator {self.operator!r}; "
+                f"choose from {list(_FOV_OPERATORS)}"
+            )
+        if not 0.0 <= self.min_fraction <= 1.0:
+            raise ValueError(f"min_fraction must be in [0, 1], got {self.min_fraction}")
+
+    def check(self, df_cells: pd.DataFrame) -> tuple[bool, float]:
+        """Check whether the condition is met on per-cell data.
+
+        Args:
+            df_cells: DataFrame with one row per cell, as returned by
+                ``FeatureExtractor.extract_features()``.
+
+        Returns:
+            ``(passed, actual_fraction)`` — whether the condition passed
+            and the actual fraction of cells that satisfied it.
+        """
+        if df_cells.empty or self.feature not in df_cells.columns:
+            return False, 0.0
+        series = df_cells[self.feature].dropna()
+        if series.empty:
+            return False, 0.0
+        op_fn = _FOV_OPERATORS[self.operator]
+        n_satisfying = op_fn(series, self.threshold).sum()
+        fraction = float(n_satisfying) / len(series)
+        return fraction >= self.min_fraction, fraction
+
 
 if TYPE_CHECKING:
     from useq import WellPlate, WellPlatePlan
@@ -150,7 +226,23 @@ class FOVFinderAgent(PreExperimentAgent):
             provided, ``extract_positions({"labels": label_image})`` is
             called per FOV and the resulting DataFrame is attached to the
             ``"all_candidates"`` output for downstream inspection.  This
-            does not affect selection.
+            does not affect selection unless *fov_conditions* is also
+            set — in which case
+            ``extract_features(labels, img_stack)`` is called instead
+            to produce per-cell features (e.g. CNR) that the conditions
+            can filter on.
+        fov_conditions: Optional list of :class:`FOVCondition` objects
+            applied per FOV to filter by per-cell features.  An FOV is
+            accepted only if it passes the cell-count check **and**
+            every condition in the list.  Requires a
+            ``feature_extractor`` that produces the referenced columns.
+            The per-cell feature table produced for each FOV is stored
+            on ``self.last_run["fov_features"]`` for inspection (keyed
+            by candidate index ``p``).  Example::
+
+                fov_conditions=[
+                    FOVCondition("cnr", "below", 0.6, min_fraction=0.8),
+                ]
         z: Z handling for the candidate positions.  Three modes:
 
             * ``None`` (default) — the agent does **not** drive focus.
@@ -211,6 +303,7 @@ class FOVFinderAgent(PreExperimentAgent):
         segmentator: Segmentator,
         seg_channel_index: int = 0,
         feature_extractor: FeatureExtractor | None = None,
+        fov_conditions: list[FOVCondition] | None = None,
         z: float | None | Literal["current"] = None,
         random_seed: int | None = None,
         name_prefix: str = "fov",
@@ -257,6 +350,11 @@ class FOVFinderAgent(PreExperimentAgent):
             raise ValueError("imaging_channels must contain at least one channel")
         if not (z is None or z == "current" or isinstance(z, (int, float))):
             raise ValueError(f"z must be None, 'current', or a float; got {z!r}")
+        if fov_conditions and feature_extractor is None:
+            raise ValueError(
+                "fov_conditions requires a feature_extractor that produces "
+                "the referenced feature columns (e.g. FE_ErkKtr for 'cnr')."
+            )
 
         self.well_plate_plan_input = well_plate_plan
         self.wells_per_phase = int(wells_per_phase)
@@ -270,6 +368,7 @@ class FOVFinderAgent(PreExperimentAgent):
         self.segmentator = segmentator
         self.seg_channel_index = int(seg_channel_index)
         self.feature_extractor = feature_extractor
+        self.fov_conditions: list[FOVCondition] = list(fov_conditions or [])
         self.z = z
         self.random_seed = random_seed
         self.name_prefix = name_prefix
@@ -449,9 +548,17 @@ class FOVFinderAgent(PreExperimentAgent):
         """Run segmentation per FOV and return a DataFrame of cell counts.
 
         Optionally also runs the configured ``feature_extractor`` per FOV.
+        When :attr:`fov_conditions` is set, calls the extractor's
+        ``extract_features`` (instead of ``extract_positions``) to obtain
+        per-cell features (e.g. CNR), evaluates every condition, and marks
+        the FOV invalid if any condition fails.  The per-cell feature
+        DataFrames are stashed on ``self._last_fov_features`` keyed by ``p``.
         """
         n_channels = len(self.imaging_channels)
         rows: list[dict[str, Any]] = []
+        # Reset per-call storage of per-cell feature tables (one per FOV
+        # that actually had extract_features called on it).
+        self._last_fov_features: dict[int, pd.DataFrame] = {}
 
         for p_idx, fp in enumerate(positions):
             channel_imgs = []
@@ -507,23 +614,82 @@ class FOVFinderAgent(PreExperimentAgent):
             }
 
             if self.feature_extractor is not None:
-                try:
-                    df_features = self.feature_extractor.extract_positions(
-                        {"labels": label_img}
-                    )
-                    if df_features is not None and not df_features.empty:
+                # Two paths:
+                #   * fov_conditions set -> call extract_features() so we
+                #     have per-cell features (e.g. CNR) to filter on.
+                #   * no fov_conditions  -> keep the original cheap
+                #     extract_positions() path (label, x, y aggregates).
+                if self.fov_conditions and valid:
+                    used_mask = getattr(self.feature_extractor, "used_mask", "labels")
+                    try:
+                        fe_result = self.feature_extractor.extract_features(
+                            {used_mask: label_img}, img_stack
+                        )
+                    except Exception as e:  # pragma: no cover - user-supplied FE
+                        print(
+                            f"[FOVFinderAgent] extract_features failed at FOV "
+                            f"{p_idx}: {type(e).__name__}: {e}"
+                        )
+                        fe_result = None
+
+                    # extract_features may return (df, extra_masks) or just df.
+                    if isinstance(fe_result, tuple) and fe_result:
+                        df_features = fe_result[0]
+                    else:
+                        df_features = fe_result
+
+                    if df_features is None or df_features.empty:
+                        valid = False
+                        reason = "feature_extraction_empty"
+                    else:
+                        self._last_fov_features[p_idx] = df_features
+                        row["n_cells_features"] = int(len(df_features))
+                        # Summary stats for inspection
                         for col in df_features.columns:
                             if col == "label":
                                 continue
                             try:
                                 row[f"fe_{col}_mean"] = float(df_features[col].mean())
+                                row[f"fe_{col}_median"] = float(
+                                    df_features[col].median()
+                                )
                             except (TypeError, ValueError):
                                 pass
-                except Exception as e:  # pragma: no cover - user-supplied FE
-                    print(
-                        f"[FOVFinderAgent] feature_extractor failed at FOV "
-                        f"{p_idx}: {type(e).__name__}: {e}"
-                    )
+                        # Evaluate every FOV condition; first failure wins.
+                        for cond in self.fov_conditions:
+                            passed, fraction = cond.check(df_features)
+                            row[f"cond_{cond.feature}_{cond.operator}_frac"] = fraction
+                            if not passed:
+                                valid = False
+                                reason = (
+                                    f"condition_failed:{cond.feature}"
+                                    f"_{cond.operator}_{cond.threshold}"
+                                    f"@{cond.min_fraction:.2f}"
+                                )
+                                break
+                    # Update the row's valid/reason (they may have changed).
+                    row["valid"] = valid
+                    row["reason"] = reason
+                else:
+                    try:
+                        df_features = self.feature_extractor.extract_positions(
+                            {"labels": label_img}
+                        )
+                        if df_features is not None and not df_features.empty:
+                            for col in df_features.columns:
+                                if col == "label":
+                                    continue
+                                try:
+                                    row[f"fe_{col}_mean"] = float(
+                                        df_features[col].mean()
+                                    )
+                                except (TypeError, ValueError):
+                                    pass
+                    except Exception as e:  # pragma: no cover - user-supplied FE
+                        print(
+                            f"[FOVFinderAgent] feature_extractor failed at FOV "
+                            f"{p_idx}: {type(e).__name__}: {e}"
+                        )
 
             rows.append(row)
 
@@ -688,6 +854,9 @@ class FOVFinderAgent(PreExperimentAgent):
             "wells_used": list(wells),
             "all_candidates": df_scan,
             "phase": phase,
+            # Per-cell feature DataFrames keyed by candidate index p.
+            # Empty when fov_conditions is not set.
+            "fov_features": getattr(self, "_last_fov_features", {}),
         }
         self.history.append(
             {
