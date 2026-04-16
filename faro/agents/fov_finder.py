@@ -161,6 +161,96 @@ def _farthest_point_sampling(
     return selected
 
 
+def _extreme_sampling(
+    values: np.ndarray,
+    k: int,
+    *,
+    points: np.ndarray | None = None,
+) -> list[int]:
+    """Pick ``k`` indices spanning the extremes of ``values``.
+
+    Primary criterion: feature value at evenly-spaced quantile targets
+    along the sorted axis, so ``k=2`` picks the min and max, ``k=3``
+    picks min/median/max, etc.  Secondary criterion: when ``points`` is
+    supplied, feature-value ties and near-ties are broken in favour of
+    candidates **farthest** from already-picked FOVs (max-min spatial
+    distance).  This preserves the "extremes first, spread second"
+    contract so that e.g. two candidates with equal cell counts don't
+    end up clustered in one corner of the well.
+
+    Examples:
+        ``values=[36, 135, 136, 200]``, ``k=2`` -> indices of ``36`` and
+        ``200`` (unique values, no tiebreak needed).
+        ``values=[40, 40, 200, 200]``, ``k=2`` with ``points`` -> the
+        ``40`` and ``200`` candidates that are furthest apart in (x, y).
+
+    Args:
+        values: ``(N,)`` scalar feature values (e.g. cell counts).
+        k: Number of points to select. If ``k >= N`` returns all indices
+            in feature-sorted order.
+        points: Optional ``(N, 2)`` spatial coordinates.  When given,
+            ties on the feature axis are broken by maximising minimum
+            spatial distance to previously-picked FOVs.  When omitted
+            the selector falls back to rank-based picking with stable
+            tiebreaking.
+
+    Returns:
+        List of indices into *values*, ordered by selection (first is
+        the min-feature slot, last is the max-feature slot).
+    """
+    n = len(values)
+    if k <= 0 or n == 0:
+        return []
+    vals = np.asarray(values)
+    order = np.argsort(vals, kind="stable")
+    if k >= n:
+        return [int(i) for i in order]
+    if k == 1:
+        return [int(order[n // 2])]
+
+    target_ranks = np.linspace(0, n - 1, k).round().astype(int)
+
+    if points is None:
+        # Legacy fast path: pick directly at the integer target ranks,
+        # deduping defensively (rounding can collide for small n).
+        seen: set[int] = set()
+        out: list[int] = []
+        for rank in target_ranks:
+            idx = int(order[int(rank)])
+            if idx in seen:
+                continue
+            seen.add(idx)
+            out.append(idx)
+        return out
+
+    pts = np.asarray(points, dtype=float)
+    target_values = vals[order][target_ranks]
+
+    picked: list[int] = []
+    picked_set: set[int] = set()
+    for target_val in target_values:
+        unpicked = [i for i in range(n) if i not in picked_set]
+        if not unpicked:
+            break
+        unpicked_arr = np.asarray(unpicked, dtype=int)
+        feat_dist = np.abs(vals[unpicked_arr] - target_val)
+        if picked:
+            picked_pts = pts[picked]
+            # Max-min distance: each candidate scored by its nearest
+            # already-picked neighbour; we then maximise that score.
+            diffs = pts[unpicked_arr][:, None, :] - picked_pts[None, :, :]
+            spatial_dist = np.linalg.norm(diffs, axis=-1).min(axis=1)
+        else:
+            spatial_dist = np.zeros(len(unpicked_arr))
+        # Lexsort's last key is primary — feature-distance wins, ties
+        # broken by *maximising* spatial distance (negated for argsort).
+        rank = np.lexsort((-spatial_dist, feat_dist))
+        best = int(unpicked_arr[int(rank[0])])
+        picked.append(best)
+        picked_set.add(best)
+    return picked
+
+
 class FOVFinderAgent(PreExperimentAgent):
     """Pick good FOV positions inside wells using a saved plate calibration.
 
@@ -243,6 +333,29 @@ class FOVFinderAgent(PreExperimentAgent):
                 fov_conditions=[
                     FOVCondition("cnr", "below", 0.6, min_fraction=0.8),
                 ]
+        selection_mode: How to pick ``fovs_per_well`` positions from the
+            valid candidates of each well:
+
+            * ``"farthest_point"`` (default) — greedy max-min sampling on
+                (x, y) so the picked FOVs are maximally spread in space.
+                Use this when you want low spatial overlap and don't care
+                which cells you land on.
+            * ``"extremes"`` — sort the valid candidates by
+                ``selection_feature`` and pick ``fovs_per_well`` evenly-
+                spaced positions spanning the min and max.  For
+                ``fovs_per_well=2`` this returns the FOVs with the
+                lowest and highest feature value; for ``=3`` it adds the
+                median.  Useful for picking a contrast pair (e.g. the
+                sparsest and densest FOV inside the valid cell-count
+                window) instead of a spatially spread set.  Ties on the
+                feature axis are broken by **spatial distance** —
+                candidates farther from already-picked FOVs win, so two
+                equally-extreme candidates won't end up clustered.
+        selection_feature: Column name in the per-candidate scan
+            DataFrame used as the axis for ``selection_mode="extremes"``.
+            Defaults to ``"n_cells"``.  Any column produced by the scan
+            works (e.g. ``"fe_cnr_mean"`` when a ``feature_extractor`` is
+            configured).  Ignored in ``"farthest_point"`` mode.
         z: Z handling for the candidate positions.  Three modes:
 
             * ``None`` (default) — the agent does **not** drive focus.
@@ -304,6 +417,8 @@ class FOVFinderAgent(PreExperimentAgent):
         seg_channel_index: int = 0,
         feature_extractor: FeatureExtractor | None = None,
         fov_conditions: list[FOVCondition] | None = None,
+        selection_mode: Literal["farthest_point", "extremes"] = "farthest_point",
+        selection_feature: str = "n_cells",
         z: float | None | Literal["current"] = None,
         random_seed: int | None = None,
         name_prefix: str = "fov",
@@ -355,6 +470,11 @@ class FOVFinderAgent(PreExperimentAgent):
                 "fov_conditions requires a feature_extractor that produces "
                 "the referenced feature columns (e.g. FE_ErkKtr for 'cnr')."
             )
+        if selection_mode not in ("farthest_point", "extremes"):
+            raise ValueError(
+                f"selection_mode must be 'farthest_point' or 'extremes'; "
+                f"got {selection_mode!r}"
+            )
 
         self.well_plate_plan_input = well_plate_plan
         self.wells_per_phase = int(wells_per_phase)
@@ -369,6 +489,8 @@ class FOVFinderAgent(PreExperimentAgent):
         self.seg_channel_index = int(seg_channel_index)
         self.feature_extractor = feature_extractor
         self.fov_conditions: list[FOVCondition] = list(fov_conditions or [])
+        self.selection_mode = selection_mode
+        self.selection_feature = str(selection_feature)
         self.z = z
         self.random_seed = random_seed
         self.name_prefix = name_prefix
@@ -783,15 +905,30 @@ class FOVFinderAgent(PreExperimentAgent):
                 continue
 
             if n_valid > 0:
-                xy = df_valid[["x", "y"]].to_numpy()
-                seed_offset = (
-                    None
-                    if self.random_seed is None
-                    else self.random_seed + 7919 * phase + w_idx
-                )
-                picked_local = _farthest_point_sampling(
-                    xy, self.fovs_per_well, seed=seed_offset
-                )
+                if self.selection_mode == "extremes":
+                    if self.selection_feature not in df_valid.columns:
+                        raise RuntimeError(
+                            f"selection_feature {self.selection_feature!r} not "
+                            f"found in scan columns {list(df_valid.columns)}. "
+                            f"When using selection_mode='extremes' with a "
+                            f"feature-extractor column, make sure the "
+                            f"feature_extractor produces it."
+                        )
+                    values = df_valid[self.selection_feature].to_numpy(dtype=float)
+                    xy = df_valid[["x", "y"]].to_numpy(dtype=float)
+                    picked_local = _extreme_sampling(
+                        values, self.fovs_per_well, points=xy
+                    )
+                else:
+                    xy = df_valid[["x", "y"]].to_numpy()
+                    seed_offset = (
+                        None
+                        if self.random_seed is None
+                        else self.random_seed + 7919 * phase + w_idx
+                    )
+                    picked_local = _farthest_point_sampling(
+                        xy, self.fovs_per_well, seed=seed_offset
+                    )
                 df_picked = df_valid.iloc[picked_local]
             else:
                 df_picked = df_w.iloc[0:0]  # empty frame with same columns
