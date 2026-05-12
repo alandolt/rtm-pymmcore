@@ -17,6 +17,8 @@ so that importing this module without them installed does not crash).
 from __future__ import annotations
 
 import dataclasses
+import os
+import time
 from abc import abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -172,9 +174,58 @@ class BOptGPAX(InterPhaseAgent):
         ei_num_samples: Number of posterior samples for EI/UCB computation.
         ei_noiseless: Whether to use noiseless predictions.
         n_cov_samples: Number of covariate samples for marginalisation.
+        cov_marginalization_mode: ``"joint"`` (default, recommended) or
+            ``"mesh"``.  ``"joint"`` samples *rows* from ``df_results`` so
+            each covariate sample is a real (correlated) combination seen in
+            the data — the total number of scenarios per grid point is
+            ``n_cov_samples``, regardless of how many covariates you have.
+            ``"mesh"`` resamples each covariate independently and takes
+            the outer product, giving ``n_cov_samples ** n_covariates``
+            scenarios — this grows explosively and is usually much slower
+            without being more accurate (it ignores cross-covariate
+            correlations in the observed data).
         penalty: ``None``, ``"delta"``, or ``"inverse_distance"`` to
             discourage re-evaluation at/near recent points.
         penalty_factor: Strength of the inverse-distance penalty.
+        n_conditions_per_iter: Number of distinct parameter sets ("conditions")
+            evaluated per BO phase.  ``1`` (default) preserves the legacy
+            single-condition behaviour.  ``> 1`` enables **batch BO**: each
+            phase picks ``n_conditions_per_iter`` parameter sets via
+            sequential greedy acquisition with local penalisation, splits
+            the configured FOVs evenly between them, and evaluates them
+            simultaneously.  Subclasses must override
+            :meth:`_create_events_for_batch` (and typically
+            :meth:`_preprocess_results`) to map conditions to FOV subsets.
+        batch_penalty_factor: Penalty factor used during the inner sequential
+            greedy loop in :meth:`_select_batch_parameters` to keep the
+            ``n_conditions_per_iter`` selected points apart.  Only used
+            when ``n_conditions_per_iter > 1``.
+        n_initial_phases: Number of phases at the start of the experiment
+            that use **farthest-point initial sampling** instead of BO
+            acquisition.  Default ``1`` (legacy behaviour — only the
+            first phase is initial).  Increase to ``2`` (or more) to
+            give a high-dimensional GP more distinct controllable
+            coordinates to learn lengthscales from before trusting EI.
+            A rule of thumb is to aim for roughly ``2 * n_controllable``
+            distinct coordinates before BO kicks in; with
+            ``n_conditions_per_iter=3`` and 2 controllable dims, that
+            means ``n_initial_phases=2`` (6 coordinates total).  All
+            ``n_initial_phases * n_conditions_per_iter`` initial picks
+            are generated in one pass on the first initial phase via
+            farthest-point sampling on ``x_unmeasured``, then doled out
+            ``n_conditions_per_iter`` at a time.  This gives mutually
+            well-spread initial coordinates across phases rather than
+            independently-spread batches that might cluster.
+        initial_exploration_cap: Optional fraction in ``(0, 1]`` that, if set,
+            restricts farthest-point sampling during the initial phases to
+            the lower-``cap`` slice of each parameter's range.  For a
+            parameter with bounds ``[lo, hi]``, only grid points with
+            ``x <= lo + cap * (hi - lo)`` are eligible.  Example:
+            ``cap=0.75`` limits initial picks to the bottom 75% of each
+            parameter axis, useful when the upper corner of the grid would
+            violate a cycle-time or physical budget and you only want to
+            avoid it during random exploration.  Default ``None`` = no cap
+            (use the full grid, legacy behaviour).
         verbose: If True, plot acquisition landscape each iteration.
     """
 
@@ -194,8 +245,13 @@ class BOptGPAX(InterPhaseAgent):
         ei_num_samples: int = 16,
         ei_noiseless: bool = True,
         n_cov_samples: int = 10,
+        cov_marginalization_mode: str = "joint",
         penalty: Optional[str] = None,
         penalty_factor: float = 1.0,
+        n_conditions_per_iter: int = 1,
+        batch_penalty_factor: float = 2.0,
+        n_initial_phases: int = 1,
+        initial_exploration_cap: Optional[float] = None,
         prior=None,
         verbose: bool = False,
     ):
@@ -238,6 +294,13 @@ class BOptGPAX(InterPhaseAgent):
         self.ei_num_samples = int(ei_num_samples)
         self.ei_noiseless = bool(ei_noiseless)
         self.n_cov_samples = int(n_cov_samples)
+        cov_marginalization_mode = cov_marginalization_mode.lower().strip()
+        if cov_marginalization_mode not in {"joint", "mesh"}:
+            raise ValueError(
+                f"Unknown cov_marginalization_mode={cov_marginalization_mode!r}, "
+                f"expected 'joint' or 'mesh'."
+            )
+        self.cov_marginalization_mode = cov_marginalization_mode
         self._rng = np.random.default_rng(self._seed)
 
         if penalty is not None:
@@ -250,9 +313,48 @@ class BOptGPAX(InterPhaseAgent):
         self.penalty = penalty
         self.penalty_factor = float(penalty_factor)
 
+        if n_conditions_per_iter < 1:
+            raise ValueError(
+                f"n_conditions_per_iter must be >= 1, got {n_conditions_per_iter}"
+            )
+        self.n_conditions_per_iter = int(n_conditions_per_iter)
+        self.batch_penalty_factor = float(batch_penalty_factor)
+
+        if n_initial_phases < 0:
+            raise ValueError(f"n_initial_phases must be >= 0, got {n_initial_phases}")
+        # n_initial_phases=0 is valid when df_results is pre-seeded with
+        # prior observations (e.g. memory/bootstrap from a previous run).
+        # The initial-sampling code path is skipped entirely in that case.
+        self.n_initial_phases = int(n_initial_phases)
+
+        if initial_exploration_cap is not None:
+            cap = float(initial_exploration_cap)
+            if not (0.0 < cap <= 1.0):
+                raise ValueError(
+                    f"initial_exploration_cap must be in (0, 1], got {cap}"
+                )
+            self.initial_exploration_cap = cap
+        else:
+            self.initial_exploration_cap = None
+        # Lazy-initialised FIFO of pre-generated farthest-point picks for
+        # the initial phases.  Populated on the first initial phase with
+        # ``n_initial_phases * n_conditions_per_iter`` mutually-spread
+        # coordinates, then consumed ``n_conditions_per_iter`` at a time.
+        self._initial_pick_queue: list[dict] | None = None
+
+        # Per-phase state populated by run_one_phase / run for batch BO.
+        # Subclasses (or their _create_events_for_batch /
+        # _preprocess_results overrides) read these to know which condition
+        # a given FOV belongs to and which phase id is currently active.
+        self._phase_counter: int = 0
+        self._fov_index_offset: int = 0
+        self._current_phase_id: int = 0
+        self._current_condition_map: dict[int, dict] = {}
+
         self._acquisition_used_this_round = self.acquisition_function
 
         self.verbose = verbose
+        self.save_phase_logs = True
         self._iteration_means: list[float] = []
 
     # ------------------------------------------------------------------
@@ -293,8 +395,243 @@ class BOptGPAX(InterPhaseAgent):
             DataFrame with columns matching all :attr:`parameters_to_optimize`
             names, all :attr:`bo_covariates` names, and the
             :attr:`objective_metric` name.  Each row is one observation.
+
+        Note:
+            In **batch BO** mode (``n_conditions_per_iter > 1``) the base
+            class populates :attr:`_current_phase_id` and
+            :attr:`_current_condition_map` before calling this method, so
+            subclasses can look up which condition a FOV belongs to.
         """
         ...
+
+    def _create_events_for_batch(self, param_list: list[dict]) -> list:
+        """Build RTMEvents for one *batch* of conditions.
+
+        Default implementation only handles the single-condition case
+        (``len(param_list) == 1``) and delegates to
+        :meth:`_create_events_for_cycle` so existing single-condition
+        subclasses keep working unchanged.
+
+        Subclasses that set ``n_conditions_per_iter > 1`` must override
+        this method to:
+
+        1. Split :attr:`fov_positions` into ``len(param_list)`` chunks
+           (one per condition) -- the conventional layout is equal-sized
+           chunks of ``len(self.fovs) // len(param_list)`` FOVs.
+        2. Build per-condition events, applying any per-condition FOV-index
+           offset (``self._fov_index_offset``) so phase-specific FOV ids
+           remain unique across phases.
+        3. Populate :attr:`_current_condition_map` so
+           :meth:`_preprocess_results` can map each FOV back to the
+           parameter set that generated it.
+        4. Return the merged event list (typically passed through
+           ``faro.core.utils.apply_fov_batching``).
+        """
+        if len(param_list) != 1:
+            raise NotImplementedError(
+                f"Default _create_events_for_batch only supports single-condition "
+                f"batches (got {len(param_list)} conditions). Override "
+                f"_create_events_for_batch in your subclass for batch BO."
+            )
+        return self._create_events_for_cycle(param_list[0])
+
+    def _on_phase_complete(self, df_new: pd.DataFrame, phase_id: int) -> None:
+        """Hook called at the end of each batch BO phase.
+
+        Default implementation is a no-op.  Override to add live
+        plotting, checkpoint saving, or other side effects.  Called from
+        :meth:`_run_one_phase_batch` and :meth:`_run_batch_loop` *after*
+        the new observations have been concatenated into
+        :attr:`df_results`, so ``self.df_results`` reflects the full
+        history at call time.
+
+        Args:
+            df_new: The fresh observations from this phase only.
+            phase_id: Zero-based phase index.
+        """
+        pass
+
+    # ------------------------------------------------------------------
+    # Phase logging
+    # ------------------------------------------------------------------
+
+    def _open_phase_log(self, phase_id: int):
+        """Return a context manager that tees stdout/stderr to a log file.
+
+        Log files are written to ``{storage_path}/logs/phase_{phase_id:03d}.log``.
+        Output is **not** suppressed — it still appears in the notebook /
+        console as usual.
+        """
+        import contextlib
+        import sys
+
+        log_dir = os.path.join(self.storage_path, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"phase_{phase_id:03d}.log")
+
+        class _Tee:
+            def __init__(self, original, log_file):
+                self._original = original
+                self._log = log_file
+
+            def write(self, msg):
+                self._original.write(msg)
+                self._log.write(msg)
+                self._log.flush()
+
+            def flush(self):
+                self._original.flush()
+                self._log.flush()
+
+        @contextlib.contextmanager
+        def _ctx():
+            f = open(log_path, "w", encoding="utf-8")
+            old_out, old_err = sys.stdout, sys.stderr
+            sys.stdout = _Tee(old_out, f)
+            sys.stderr = _Tee(old_err, f)
+            try:
+                yield
+            finally:
+                sys.stdout = old_out
+                sys.stderr = old_err
+                f.close()
+
+        return _ctx()
+
+    # ------------------------------------------------------------------
+    # Model persistence
+    # ------------------------------------------------------------------
+
+    def save_model(self, path: str | None = None) -> str | None:
+        """Save the trained GP + scalers + metadata for post-hoc analysis.
+
+        Pickles a single dict via ``joblib`` containing everything you
+        need to (a) recreate predictions on new (parameter, covariate)
+        combinations, (b) compute per-dimension sensitivity from the
+        ARD lengthscale posterior, and (c) plot the marginalised
+        landscape outside the experiment notebook.  The same scalers
+        used during training are bundled, so any external code can do
+        ``x_full_scaled = payload['x_scaler'].transform(x_full)`` then
+        ``payload['model'].predict(...)`` directly.
+
+        Called automatically after each phase from
+        :class:`OscillationBO._on_phase_complete`, so even if the
+        experiment crashes mid-way the most recent fit is on disk.
+        Can also be invoked manually after ``composed_agent.run()``
+        with a custom path if you want a separate snapshot.
+
+        Args:
+            path: Destination ``.joblib`` file.  Defaults to
+                ``{storage_path}/models/bo_model_iter_{iteration:03d}.joblib``
+                so every BO phase gets its own snapshot.
+
+        Returns:
+            The path written to, or ``None`` if no model has been fit
+            yet (e.g. called during the initial-spread phases) or if
+            saving failed for any reason (errors are caught and printed
+            so they cannot interrupt the experiment loop).
+        """
+        import joblib
+
+        if self.model is None:
+            print("  [save_model] no model to save (BO has not fit yet)")
+            return None
+
+        if path is None:
+            models_dir = os.path.join(self.storage_path, "models")
+            os.makedirs(models_dir, exist_ok=True)
+            path = os.path.join(
+                models_dir, f"bo_model_iter_{self.iteration:03d}.joblib"
+            )
+
+        try:
+            rng = getattr(self, "_rng_key_predict", None)
+
+            # Serialize the GP's trained state (MCMC/SVI samples) rather
+            # than the live model object.  The gpax model holds JAX-traced
+            # kernel functions that can't be pickled, but the posterior
+            # samples (a plain dict of numpy arrays) are all you need to
+            # recreate predictions later via gpax.ExactGP.predict().
+            model_state = None
+            if self.model is not None:
+                samples = getattr(self.model, "mcmc", None)
+                if samples is not None:
+                    # ExactGP (MCMC): .mcmc is a numpyro MCMC object;
+                    # .get_samples() returns a dict[str, jax.Array].
+                    # Store the kernel name as a string, not the kernel
+                    # function itself (which is a JAX-traced callable
+                    # that can't be pickled).
+                    kernel_attr = getattr(self.model, "kernel", "Matern")
+                    kernel_name = (
+                        kernel_attr
+                        if isinstance(kernel_attr, str)
+                        else getattr(kernel_attr, "__name__", "Matern")
+                    )
+                    model_state = {
+                        "backend": "ExactGP",
+                        "kernel": kernel_name,
+                        "input_dim": getattr(self.model, "input_dim", None),
+                        "samples": {
+                            k: np.asarray(v) for k, v in samples.get_samples().items()
+                        },
+                        "X_train": (
+                            np.asarray(self.model.X_train)
+                            if self.model.X_train is not None
+                            else None
+                        ),
+                        "y_train": (
+                            np.asarray(self.model.y_train)
+                            if self.model.y_train is not None
+                            else None
+                        ),
+                    }
+                else:
+                    # viSparseGP / viGP: store params + guide state
+                    params = getattr(self.model, "kernel_params", None)
+                    model_state = {
+                        "backend": type(self.model).__name__,
+                        "kernel_params": (
+                            {k: np.asarray(v) for k, v in params.items()}
+                            if params is not None
+                            else None
+                        ),
+                    }
+
+            payload = dict(
+                model_state=model_state,
+                x_scaler=getattr(self, "_x_scaler", None),
+                y_scaler=getattr(self, "_y_scaler", None),
+                rng_key_predict=(np.asarray(rng) if rng is not None else None),
+                parameter_names=[p.name for p in self.parameters_to_optimize],
+                parameter_bounds=[tuple(p.bounds) for p in self.parameters_to_optimize],
+                parameter_log_scale=[
+                    bool(p.log_scale) for p in self.parameters_to_optimize
+                ],
+                covariate_names=[c.name for c in self.bo_covariates],
+                covariate_bounds=[
+                    tuple(c.bounds) if c.bounds is not None else None
+                    for c in self.bo_covariates
+                ],
+                objective_name=self.objective_metric.name,
+                objective_goal=self.objective_metric.goal,
+                df_results=(
+                    self.df_results.copy()
+                    if getattr(self, "df_results", None) is not None
+                    else None
+                ),
+                iteration=self.iteration,
+                n_iterations=self.n_iterations,
+                n_initial_phases=self.n_initial_phases,
+                n_conditions_per_iter=self.n_conditions_per_iter,
+                acquisition_function=self.acquisition_function,
+                cov_marginalization_mode=self.cov_marginalization_mode,
+                n_cov_samples=self.n_cov_samples,
+            )
+            joblib.dump(payload, path)
+            return path
+        except Exception as exc:  # pragma: no cover - best-effort
+            print(f"  Warning: could not save BO model to {path}: {exc}")
+            return None
 
     # ------------------------------------------------------------------
     # Per-phase API (composable) + main experiment loop
@@ -313,11 +650,22 @@ class BOptGPAX(InterPhaseAgent):
     ) -> dict | None:
         """Run a single BO phase.
 
-        For single-condition BO this is one BO iteration: pick the next
-        parameter set (initial spread for early phases, GP-acquisition
-        otherwise), build events, run/continue the experiment, wait for
-        the pipeline, read tracks and append observations to
-        :attr:`df_results`.
+        Dispatches to :meth:`_run_one_phase_single` or
+        :meth:`_run_one_phase_batch` based on
+        :attr:`n_conditions_per_iter`.
+
+        For single-condition BO (``n_conditions_per_iter == 1``) this is
+        one BO iteration: pick the next parameter set (initial spread for
+        early phases, GP-acquisition otherwise), build events, run/continue
+        the experiment, wait for the pipeline, read tracks and append
+        observations to :attr:`df_results`.
+
+        For batch BO (``n_conditions_per_iter > 1``) it picks
+        ``n_conditions_per_iter`` parameter sets via sequential greedy
+        acquisition with local penalisation, splits the configured FOVs
+        between them, evaluates them simultaneously, and shifts FOV ids by
+        ``phase_id * len(fov_positions)`` so each phase gets globally
+        unique FOV indices (avoids stale tracker state across phases).
 
         This method is the primary integration point for
         :class:`ComposedAgent` — composing BO with a per-phase
@@ -330,13 +678,28 @@ class BOptGPAX(InterPhaseAgent):
                 ``continue_experiment``.
             fov_positions: Optional list of stage positions for this
                 phase.  When provided, replaces the agent's current FOVs.
-            fovs: Optional list of FOV indices.  Defaults to
-                ``range(len(fov_positions))`` when *fov_positions* is given.
+            fovs: Optional list of FOV indices.  Single-condition mode
+                only -- in batch mode the FOV ids are derived from
+                ``phase_id`` and ignored if supplied.
 
         Returns:
             ``{"params": ..., "df_new": ..., "phase_id": phase_id}`` or
-            ``None`` if no results were produced.
+            ``None`` if no results were produced.  In batch mode
+            ``params`` is a list of condition dicts.
         """
+        if self.n_conditions_per_iter > 1:
+            return self._run_one_phase_batch(phase_id, fov_positions=fov_positions)
+        return self._run_one_phase_single(
+            phase_id, fov_positions=fov_positions, fovs=fovs
+        )
+
+    def _run_one_phase_single(
+        self,
+        phase_id: int,
+        fov_positions: list | None = None,
+        fovs: list[int] | None = None,
+    ) -> dict | None:
+        """Single-condition variant of :meth:`run_one_phase`."""
         self._ensure_results_df()
 
         # Update FOVs if positions were supplied for this phase.
@@ -353,13 +716,31 @@ class BOptGPAX(InterPhaseAgent):
             )
 
         # --- Pick next parameter set ----------------------------------
-        if self.df_results.empty or len(self.df_results) < 4:
-            initial, _ = self._select_initial_samples(k=1)
-            if isinstance(initial, dict):
-                params = initial
-            else:
-                params = initial[0]
-            print(f"=== Phase {phase_id}: initial sample {params} ===")
+        # See _run_one_phase_batch for the rationale behind n_initial_phases
+        # and the pre-generated farthest-point queue.  In single-condition
+        # mode (n_conditions_per_iter == 1) the queue holds exactly one
+        # pick per initial phase.
+        do_initial = self.iteration < self.n_initial_phases or (
+            self.df_results.empty or len(self.df_results) < 4
+        )
+        if do_initial:
+            if self._initial_pick_queue is None or len(self._initial_pick_queue) == 0:
+                remaining_initial_phases = max(
+                    1, self.n_initial_phases - self.iteration
+                )
+                total_initial_picks = (
+                    remaining_initial_phases * self.n_conditions_per_iter
+                )
+                all_initial, _ = self._select_initial_samples(k=total_initial_picks)
+                if isinstance(all_initial, dict):
+                    all_initial = [all_initial]
+                self._initial_pick_queue = list(all_initial)
+            params = self._initial_pick_queue[0]
+            self._initial_pick_queue = self._initial_pick_queue[1:]
+            print(
+                f"=== Phase {phase_id}: initial sample "
+                f"{self.iteration + 1}/{self.n_initial_phases}: {params} ==="
+            )
         else:
             params = self._determine_next_parameters(
                 self.df_results, verbose=self.verbose
@@ -374,7 +755,7 @@ class BOptGPAX(InterPhaseAgent):
             self.controller.continue_experiment(events, validate=False)
 
         # --- Wait + collect results -----------------------------------
-        self._wait_for_pipeline()
+        self._wait_for_pipeline(timeout=self._phase_pipeline_timeout())
         tracks = {fov: self.read_tracks(fov) for fov in self.fovs}
         df_new = self._preprocess_results(tracks)
         if not df_new.empty:
@@ -390,8 +771,252 @@ class BOptGPAX(InterPhaseAgent):
         self.iteration += 1
         return {"params": params, "df_new": df_new, "phase_id": phase_id}
 
+    def _run_one_phase_batch(
+        self,
+        phase_id: int,
+        fov_positions: list | None = None,
+    ) -> dict | None:
+        """Batch variant of :meth:`run_one_phase`.
+
+        Picks :attr:`n_conditions_per_iter` parameter sets, splits the
+        FOVs evenly between them, builds events via
+        :meth:`_create_events_for_batch`, runs/continues the experiment,
+        and reads phase-suffixed tracks.
+
+        FOV indices are shifted by ``phase_id * len(fov_positions)`` so
+        each phase gets globally unique FOV ids.  Subclasses' overrides of
+        :meth:`_create_events_for_batch` should respect
+        ``self._fov_index_offset`` when building per-condition position
+        lists.
+        """
+        self._ensure_results_df()
+
+        if fov_positions is None:
+            raise ValueError(
+                "Batch BO run_one_phase requires fov_positions "
+                "(typically supplied per-phase by a pre-phase agent like "
+                "FOVFinderAgent)."
+            )
+        n_per_phase = len(fov_positions)
+        if n_per_phase % self.n_conditions_per_iter != 0:
+            raise ValueError(
+                f"Number of FOVs per phase ({n_per_phase}) must be divisible "
+                f"by n_conditions_per_iter ({self.n_conditions_per_iter})."
+            )
+
+        self.fov_positions = list(fov_positions)
+        self._fov_index_offset = phase_id * n_per_phase
+        self.fovs = list(
+            range(self._fov_index_offset, self._fov_index_offset + n_per_phase)
+        )
+        self._phase_counter = phase_id
+        self._current_phase_id = phase_id
+
+        # --- Capture phase output to a log file ----------------------
+        _log_ctx = None
+        if self.save_phase_logs:
+            _log_ctx = self._open_phase_log(phase_id)
+            _log_ctx.__enter__()
+
+        try:
+            return self._run_one_phase_batch_inner(phase_id, batch_params=None)
+        finally:
+            if _log_ctx is not None:
+                _log_ctx.__exit__(None, None, None)
+
+    def _run_one_phase_batch_inner(
+        self, phase_id: int, *, batch_params=None
+    ) -> dict | None:
+        """Inner body of :meth:`_run_one_phase_batch` (extracted for logging)."""
+
+        # --- Pick batch params (initial spread or BO acquisition) -----
+        # Initial phases: farthest-point spread sampling on the full
+        # discrete grid.  All picks across every initial phase are
+        # pre-generated in ONE call so they are mutually farthest-point
+        # spread, then doled out n_conditions_per_iter at a time.  This
+        # is strictly better than independent spread-sampling per phase
+        # (which can cluster the later phases near earlier picks when
+        # the farthest-point seed lands by chance near a pre-existing
+        # selection).  The fallback (df_results too tiny for GP fit) is
+        # a safety net in case n_initial_phases is set to 1 and the
+        # first phase's measurements all fail.
+        do_initial = self.iteration < self.n_initial_phases or (
+            self.df_results.empty or len(self.df_results) < 4
+        )
+        if do_initial:
+            if self._initial_pick_queue is None or len(self._initial_pick_queue) == 0:
+                remaining_initial_phases = max(
+                    1, self.n_initial_phases - self.iteration
+                )
+                total_initial_picks = (
+                    remaining_initial_phases * self.n_conditions_per_iter
+                )
+                all_initial, _ = self._select_initial_samples(k=total_initial_picks)
+                if isinstance(all_initial, dict):
+                    all_initial = [all_initial]
+                self._initial_pick_queue = list(all_initial)
+            batch_params = self._initial_pick_queue[: self.n_conditions_per_iter]
+            self._initial_pick_queue = self._initial_pick_queue[
+                self.n_conditions_per_iter :
+            ]
+            print(
+                f"=== Phase {phase_id}: initial batch "
+                f"{self.iteration + 1}/{self.n_initial_phases} ==="
+            )
+        else:
+            batch_params = self._select_batch_parameters(
+                self.df_results, n_conditions=self.n_conditions_per_iter
+            )
+            print(f"=== Phase {phase_id}: BO-selected batch ===")
+
+        for i, p in enumerate(batch_params):
+            print(f"  Condition {i}: {p}")
+
+        # Stash the selected picks so _plot_live can annotate them
+        self._current_batch_picks = [
+            [p[param.name] for param in self.parameters_to_optimize]
+            for p in batch_params
+        ]
+
+        # --- Pre-measurement plot (shows what BO picked) ---------------
+        if hasattr(self, "plot_live") and self.plot_live and not do_initial:
+            try:
+                self._plot_live(
+                    self.df_results,
+                    f"Phase {phase_id} — selected conditions (before measurement)",
+                    save_subdir="before",
+                )
+            except Exception as exc:
+                print(f"  Warning: pre-measurement plot failed: {exc}")
+
+        # --- Build events and run -------------------------------------
+        events = self._create_events_for_batch(batch_params)
+        if phase_id == 0:
+            self.controller.run_experiment(events, validate=False)
+        else:
+            # Fresh FOVs every phase → timesteps restart from 0.
+            # TODO: ideally the controller should auto-detect this from
+            # the FOV indices (new p → no offset, reused p → offset).
+            # For now offset_timepoints is an explicit flag.
+            self.controller.continue_experiment(
+                events, validate=False, offset_timepoints=False
+            )
+
+        # --- Wait + collect results -----------------------------------
+        self._wait_for_pipeline(timeout=self._phase_pipeline_timeout())
+        tracks = {fov: self.read_tracks(fov, phase_id=phase_id) for fov in self.fovs}
+        df_new = self._preprocess_results(tracks)
+        if not df_new.empty:
+            self.df_results = pd.concat([self.df_results, df_new], ignore_index=True)
+            self._iteration_means.append(
+                float(df_new[self.objective_metric.name].mean())
+            )
+            self._on_phase_complete(df_new, phase_id)
+
+        if not self.df_results.empty:
+            self.x = self._extract_x_from_df(self.df_results)
+            self.y = self._extract_y_from_df(self.df_results)
+
+        self.iteration += 1
+        return {"params": batch_params, "df_new": df_new, "phase_id": phase_id}
+
+    def _select_batch_parameters(
+        self, df_results: pd.DataFrame, n_conditions: int
+    ) -> list[dict]:
+        """Select ``n_conditions`` distinct parameter sets via sequential greedy.
+
+        After the first acquisition the inverse-distance penalty is
+        temporarily enabled so subsequent picks are pushed away from
+        already-chosen points within the same batch.  The original
+        :attr:`penalty` / :attr:`penalty_factor` are restored on return.
+
+        Used by :meth:`_run_one_phase_batch` (and the legacy ``run`` loop)
+        when :attr:`n_conditions_per_iter > 1`.
+        """
+        if df_results.empty or len(df_results) < 4:
+            initial, _ = self._select_initial_samples(k=n_conditions)
+            if isinstance(initial, dict):
+                initial = [initial]
+            return list(initial)[:n_conditions]
+
+        # Snapshot already-performed experiments BEFORE the batch loop so
+        # the final verbose plot can show them in gray while the new picks
+        # are highlighted in cyan.
+        prev_performed = (
+            self.x_performed_experiments.copy()
+            if self.x_performed_experiments is not None
+            else None
+        )
+        self._last_plot_context = None
+
+        # Fit the GP ONCE for the whole batch.  ``_batch_fit_reuse`` tells
+        # ``_determine_next_parameters`` to stash the first call's fit in
+        # ``_cached_gp_fit``; subsequent calls in this loop will reuse it,
+        # saving 2x MCMC runs per phase for a 3-condition batch.  Only
+        # the penalty (inverse-distance to previously-picked points)
+        # changes between acquisitions, so reusing the fit is exact.
+        self._cached_gp_fit = None
+        self._batch_fit_reuse = True
+
+        selected: list[dict] = []
+        orig_penalty = self.penalty
+        orig_penalty_factor = self.penalty_factor
+        try:
+            for i in range(n_conditions):
+                if i > 0:
+                    self.penalty = "inverse_distance"
+                    self.penalty_factor = self.batch_penalty_factor
+                try:
+                    # verbose=False throughout — we want a SINGLE plot at
+                    # the end of the batch showing all n_conditions picks,
+                    # not one-per-call showing only the first.
+                    params = self._determine_next_parameters(df_results, verbose=False)
+                    selected.append(params)
+                except Exception as e:
+                    print(f"  Warning: batch selection {i} failed: {e}")
+                    if len(self.x_unmeasured) > 0:
+                        idx = self._rng.integers(len(self.x_unmeasured))
+                        params = {
+                            p.name: float(self.x_unmeasured[idx, j])
+                            for j, p in enumerate(self.parameters_to_optimize)
+                        }
+                        selected.append(params)
+        finally:
+            self.penalty = orig_penalty
+            self.penalty_factor = orig_penalty_factor
+            self._batch_fit_reuse = False
+            self._cached_gp_fit = None
+
+        # Render the batch diagnostic plot with ALL picks annotated.
+        # Uses the plot context stashed by the first successful
+        # _determine_next_parameters call (which captured the clean,
+        # pre-penalty GP landscape and acquisition).
+        if (
+            self.verbose
+            and getattr(self, "_last_plot_context", None) is not None
+            and len(selected) > 0
+        ):
+            try:
+                picks_array = np.array(
+                    [
+                        [p[param.name] for param in self.parameters_to_optimize]
+                        for p in selected
+                    ],
+                    dtype=float,
+                )
+                self._plot_bo_landscape(
+                    **self._last_plot_context,
+                    next_point=None,
+                    next_points=picks_array,
+                    prev_experiments=prev_performed,
+                )
+            except Exception as exc:  # pragma: no cover - best-effort viz
+                print(f"  Warning: batch BO plot failed: {exc}")
+
+        return selected
+
     def run(self) -> None:
-        """Execute the full BO experiment loop.
+        """Execute the full BO experiment loop on a fixed set of FOVs.
 
         Convenience wrapper that calls :meth:`run_one_phase` for the
         configured number of iterations and then finalises the
@@ -403,12 +1028,24 @@ class BOptGPAX(InterPhaseAgent):
                 agent.run_one_phase(k)
             agent.controller.finish_experiment()
 
+        Dispatches to :meth:`_run_single_loop` or :meth:`_run_batch_loop`
+        based on :attr:`n_conditions_per_iter`.
+
         Raises:
             ValueError: If no FOVs have been configured via :meth:`add_fovs`.
         """
         if not self.fovs:
             raise ValueError("No FOVs configured. Call add_fovs() before run().")
 
+        if self.n_conditions_per_iter > 1:
+            self._run_batch_loop()
+        else:
+            self._run_single_loop()
+
+        self.controller.finish_experiment()
+
+    def _run_single_loop(self) -> None:
+        """Legacy single-condition ``run()`` body."""
         # Initial samples spread across the parameter space.
         initial_parameters, _ = self._select_initial_samples(k=4)
         if isinstance(initial_parameters, dict):
@@ -428,7 +1065,7 @@ class BOptGPAX(InterPhaseAgent):
             else:
                 self.controller.continue_experiment(events, validate=False)
 
-            self._wait_for_pipeline()
+            self._wait_for_pipeline(timeout=self._phase_pipeline_timeout())
             tracks = {fov: self.read_tracks(fov) for fov in self.fovs}
             df_new_results = self._preprocess_results(tracks)
             if not df_new_results.empty:
@@ -447,7 +1084,7 @@ class BOptGPAX(InterPhaseAgent):
             events = self._create_events_for_cycle(next_params)
             self.controller.continue_experiment(events, validate=False)
 
-            self._wait_for_pipeline()
+            self._wait_for_pipeline(timeout=self._phase_pipeline_timeout())
             tracks = {fov: self.read_tracks(fov) for fov in self.fovs}
             df_new_results = self._preprocess_results(tracks)
             if not df_new_results.empty:
@@ -464,9 +1101,122 @@ class BOptGPAX(InterPhaseAgent):
             self.y = self._extract_y_from_df(df_results)
         self.df_results = df_results
 
-        self.controller.finish_experiment()
+    def _run_batch_loop(self) -> None:
+        """Batch BO ``run()`` body (re-uses the configured FOVs each iteration).
+
+        Unlike :meth:`_run_one_phase_batch`, this loop does *not* shift
+        FOV indices between iterations -- the same physical FOVs are
+        reimaged every batch.  Use this for in-place batch BO; for
+        per-phase fresh-FOV batch BO drive the agent via
+        :class:`ComposedAgent` (which calls :meth:`run_one_phase`).
+        """
+        df_results = pd.DataFrame()
+        self.df_results = df_results
+
+        n_per_iter = len(self.fovs)
+        if n_per_iter % self.n_conditions_per_iter != 0:
+            raise ValueError(
+                f"Number of FOVs ({n_per_iter}) must be divisible by "
+                f"n_conditions_per_iter ({self.n_conditions_per_iter})."
+            )
+
+        # --- Initial batch (spread points, no GP yet) ----------------
+        initial_params, _ = self._select_initial_samples(k=self.n_conditions_per_iter)
+        if isinstance(initial_params, dict):
+            initial_params = [initial_params]
+        initial_params = list(initial_params)[: self.n_conditions_per_iter]
+
+        print(f"=== Initial batch: {self.n_conditions_per_iter} conditions ===")
+        for i, p in enumerate(initial_params):
+            print(f"  Condition {i}: {p}")
+
+        self._fov_index_offset = 0
+        self._current_phase_id = self._phase_counter
+        events = self._create_events_for_batch(initial_params)
+        self.controller.run_experiment(events, validate=False)
+
+        self._wait_for_pipeline(timeout=self._phase_pipeline_timeout())
+        tracks = {
+            fov: self.read_tracks(fov, phase_id=self._current_phase_id)
+            for fov in self.fovs
+        }
+        df_new = self._preprocess_results(tracks)
+        if not df_new.empty:
+            df_results = pd.concat([df_results, df_new], ignore_index=True)
+            self._iteration_means.append(
+                float(df_new[self.objective_metric.name].mean())
+            )
+            self.df_results = df_results
+            self._on_phase_complete(df_new, self._phase_counter)
+        self._phase_counter += 1
+        self.df_results = df_results
+
+        # --- BO iterations -------------------------------------------
+        for e in range(self.n_iterations):
+            print(f"\n{'='*60}")
+            print(f"=== BO Iteration {e + 1}/{self.n_iterations} ===")
+            print(f"  Data so far: {len(df_results)} observations")
+            print(f"{'='*60}")
+
+            batch_params = self._select_batch_parameters(
+                df_results, n_conditions=self.n_conditions_per_iter
+            )
+            for i, p in enumerate(batch_params):
+                print(f"  Selected condition {i}: {p}")
+
+            self._current_phase_id = self._phase_counter
+            events = self._create_events_for_batch(batch_params)
+            self.controller.continue_experiment(events, validate=False)
+
+            self._wait_for_pipeline(timeout=self._phase_pipeline_timeout())
+            tracks = {
+                fov: self.read_tracks(fov, phase_id=self._current_phase_id)
+                for fov in self.fovs
+            }
+            df_new = self._preprocess_results(tracks)
+            if not df_new.empty:
+                df_results = pd.concat([df_results, df_new], ignore_index=True)
+                self._iteration_means.append(
+                    float(df_new[self.objective_metric.name].mean())
+                )
+                self.df_results = df_results
+                self._on_phase_complete(df_new, self._phase_counter)
+            self._phase_counter += 1
+            self.iteration += 1
+            self.df_results = df_results
+
+        if not df_results.empty:
+            self.x = self._extract_x_from_df(df_results)
+            self.y = self._extract_y_from_df(df_results)
+        self.df_results = df_results
 
     # _wait_for_pipeline is inherited from InterPhaseAgent
+
+    def _phase_pipeline_timeout(self) -> float:
+        """Estimated upper bound on how long a phase needs to drain.
+
+        Derived from the configured frame layout so the timeout
+        auto-scales when ``n_frames`` / ``time_between_timesteps`` change
+        in subclasses.  Formula:
+
+            expected = n_frames * time_between_timesteps + 1800   # +30 min slack
+            timeout  = max(3600, 2 * expected)
+
+        i.e. at least 1 hour, but otherwise 2x the (acquisition + 30 min
+        processing slack) estimate.  The 2x safety factor covers the
+        gap between the per-frame loop time the acquisition was queued
+        with and the actual pipeline drain time, which depends on
+        Cellpose throughput, FOV-batching factor, and disk speed.
+
+        Subclasses without ``n_frames`` / ``time_between_timesteps``
+        attributes (i.e. the abstract base) fall back to 1 hour.
+        """
+        n_frames = getattr(self, "n_frames", None)
+        dt = getattr(self, "time_between_timesteps", None)
+        if n_frames is None or dt is None:
+            return 3600.0
+        expected = float(n_frames) * float(dt) + 1800.0
+        return max(3600.0, 2.0 * expected)
 
     # ------------------------------------------------------------------
     # EI exploration decay
@@ -574,6 +1324,52 @@ class BOptGPAX(InterPhaseAgent):
             log_scale.append(covariate.log_scale)
         return bounds, log_scale
 
+    def _sample_covariate_grid(self, df_results: pd.DataFrame) -> np.ndarray | None:
+        """Return the covariate-sample grid to marginalise over.
+
+        Shape is ``(n_samples, n_covariates)``.  In ``"joint"`` mode
+        (default) ``n_samples == self.n_cov_samples`` regardless of the
+        number of covariates — each row is a real observation from
+        ``df_results``, preserving cross-covariate correlations.  In
+        ``"mesh"`` mode the returned grid has
+        ``n_samples == self.n_cov_samples ** n_covariates`` rows (outer
+        product of independently resampled covariates), which matches the
+        legacy behaviour but scales poorly.
+
+        Returns ``None`` when there are no covariates.
+        """
+        if len(self.bo_covariates) == 0:
+            return None
+
+        n_samples = int(self.n_cov_samples)
+        n_rows = len(df_results)
+
+        if self.cov_marginalization_mode == "joint":
+            if n_rows == 0:
+                return np.zeros((n_samples, len(self.bo_covariates)), dtype=float)
+            row_idx = self._rng.integers(0, n_rows, size=n_samples)
+            return np.column_stack(
+                [
+                    np.asarray(df_results[c.name].values, dtype=float)[row_idx]
+                    for c in self.bo_covariates
+                ]
+            )
+
+        # --- mesh mode (legacy) ---
+        cov_samples_list = []
+        for covariate in self.bo_covariates:
+            cov_vals = np.asarray(df_results[covariate.name].values, dtype=float)
+            if cov_vals.size == 0:
+                cov_samples = np.array([0.0])
+            else:
+                cov_samples = self._rng.choice(cov_vals, size=n_samples, replace=True)
+            cov_samples_list.append(cov_samples)
+
+        if len(cov_samples_list) == 1:
+            return cov_samples_list[0].reshape(-1, 1)
+        cov_mesh = np.meshgrid(*cov_samples_list, indexing="ij")
+        return np.stack([m.ravel() for m in cov_mesh], axis=1)
+
     # ------------------------------------------------------------------
     # Initial sample selection (spread across parameter space)
     # ------------------------------------------------------------------
@@ -593,11 +1389,36 @@ class BOptGPAX(InterPhaseAgent):
     def _select_initial_samples(self, k=4):
         x_scaler = StandardScalerBounds()
         bounds, log_scale = self._get_bounds_and_log_scale()
-        X_scaled = x_scaler.fit_transform(
-            self.x_unmeasured, bounds=bounds, log_scale=log_scale
+
+        # Optionally restrict the farthest-point pool to a lower fraction of
+        # each parameter's range.  Keeps initial exploration inside a feasible
+        # subspace (e.g. to respect a cycle-time budget on worst-case stim
+        # exposure) while leaving BO-guided phases free to pick the full grid.
+        if self.initial_exploration_cap is not None:
+            cap = self.initial_exploration_cap
+            mask = np.ones(len(self.x_unmeasured), dtype=bool)
+            for i, param in enumerate(self.parameters_to_optimize):
+                lo, hi = param.bounds
+                thr = lo + cap * (hi - lo)
+                mask &= self.x_unmeasured[:, i] <= thr
+            if not mask.any():
+                raise ValueError(
+                    f"initial_exploration_cap={cap} produced an empty pool. "
+                    f"Check parameter bounds or lower the cap."
+                )
+            pool_global_indices = np.flatnonzero(mask)
+            pool = self.x_unmeasured[mask]
+        else:
+            pool_global_indices = np.arange(len(self.x_unmeasured))
+            pool = self.x_unmeasured
+
+        X_scaled = x_scaler.fit_transform(pool, bounds=bounds, log_scale=log_scale)
+        X_selected_scaled, selected_local_indices = self._extract_spread_points(
+            X_scaled, k=k
         )
-        X_selected_scaled, selected_indices = self._extract_spread_points(X_scaled, k=k)
         X_selected = x_scaler.inverse_transform(X_selected_scaled)
+        # Map pool-local indices back to global x_unmeasured indices
+        selected_indices = pool_global_indices[np.asarray(selected_local_indices)]
         self.x_unmeasured = np.delete(self.x_unmeasured, selected_indices, axis=0)
         self.x_performed_experiments = (
             np.concatenate([self.x_performed_experiments, X_selected], axis=0)
@@ -761,19 +1582,36 @@ class BOptGPAX(InterPhaseAgent):
 
         if self.acquisition_function == "ei":
             xi_value = self.ei_xi if xi is None else float(xi)
+            # MC-integrated EI: compare every (x, c_i) prediction against a
+            # SINGLE scalar reference, then average EI across covariate
+            # samples.  We use the **GP-predicted best marginal mean**
+            # over the control grid as the reference (BoTorch "noisy EI"
+            # / "qLogNoisyEI" style), NOT the raw observed max.
+            #
+            # Rationale: with a noisy, sparse objective like
+            # ``frac_oscillating`` (mostly 0-0.05, occasional FOV
+            # outliers at 0.15), the raw observed max sits several σ
+            # above the mean after z-scoring.  EI then computes
+            # ``u = (mu - best_f) / sigma << 0`` everywhere, the
+            # acquisition collapses to zero, and we silently fall back
+            # to UCB every phase (pure variance-seeking → jumps to
+            # grid corners instead of exploiting the top region).
+            # Using the GP's best predicted mean smooths over outlier
+            # FOVs and keeps EI numerically non-flat so it can actually
+            # drive exploitation near the observed optimum.
+            mean_marg_ref = jnp.mean(mean_matrix, axis=1)
             if maximize:
-                best_f_per_cov = jnp.max(mean_matrix, axis=0)
+                best_f_scalar = jnp.max(mean_marg_ref)
             else:
-                best_f_per_cov = jnp.min(mean_matrix, axis=0)
+                best_f_scalar = jnp.min(mean_marg_ref)
 
             print(
-                f"  best_f per covariate (scaled): "
-                f"min={float(jnp.min(best_f_per_cov)):.6f}, "
-                f"max={float(jnp.max(best_f_per_cov)):.6f}"
+                f"  best_f (scaled, from GP predicted mean over grid): "
+                f"{float(best_f_scalar):.6f}"
             )
 
             sigma_matrix = jnp.sqrt(jnp.maximum(var_matrix, 1e-12))
-            u = (mean_matrix - (best_f_per_cov[None, :] + xi_value)) / sigma_matrix
+            u = (mean_matrix - (best_f_scalar + xi_value)) / sigma_matrix
             if not maximize:
                 u = -u
             acq_matrix = sigma_matrix * (jnorm.pdf(u) + u * jnorm.cdf(u))
@@ -831,62 +1669,86 @@ class BOptGPAX(InterPhaseAgent):
     def _determine_next_parameters(
         self, df_results: pd.DataFrame, verbose=False
     ) -> dict:
-        """Fit GP, compute acquisition, and return the next parameter dict."""
+        """Fit GP, compute acquisition, and return the next parameter dict.
+
+        In batch BO (``_select_batch_parameters``) this method may be
+        called N times per phase with the **same** ``df_results`` — only
+        the penalty differs between calls.  Re-fitting the GP each time
+        wastes compute (MCMC dominates runtime).  If ``_cached_gp_fit``
+        has been populated by an earlier call in the same batch loop,
+        we reuse the cached fit and skip straight to acquisition.  The
+        batch driver is responsible for clearing the cache before the
+        next phase; non-batch callers leave ``_cached_gp_fit`` at ``None``
+        so behaviour there is unchanged.
+        """
         import gpax
         import gpax.utils
         import jax.numpy as jnp
 
-        x_scaler = StandardScalerBounds()
-        bounds, log_scale = self._get_bounds_and_log_scale()
+        cache = getattr(self, "_cached_gp_fit", None)
+        # Capture BEFORE the fit step runs — the fit step populates the
+        # cache when _batch_fit_reuse is set, so checking after would
+        # always read True on call 1 too.  We need the pre-fit state to
+        # know whether this is the first call in a batch (or a non-batch
+        # call), which controls whether we stash the plot context below.
+        is_first_call_in_batch = cache is None
+        if cache is not None:
+            gp_model = cache["gp_model"]
+            x_scaler = cache["x_scaler"]
+            y_scaler = cache["y_scaler"]
+            rng_key_predict = cache["rng_key_predict"]
+            x = cache["x"]
+            y = cache["y"]
+            print("  [reusing cached GP fit from earlier in this batch]")
+        else:
+            x_scaler = StandardScalerBounds()
+            bounds, log_scale = self._get_bounds_and_log_scale()
 
-        y_scaler = StandardScalerBounds()
-        y_log_scale = [self.objective_metric.log_scale]
+            y_scaler = StandardScalerBounds()
+            y_log_scale = [self.objective_metric.log_scale]
 
-        x_raw = self._extract_x_from_df(df_results)
-        y_raw = self._extract_y_from_df(df_results)
+            x_raw = self._extract_x_from_df(df_results)
+            y_raw = self._extract_y_from_df(df_results)
 
-        x = x_scaler.fit_transform(x_raw, bounds=bounds, log_scale=log_scale)
-        y = y_scaler.fit_transform(y_raw, bounds=None, log_scale=y_log_scale)
+            x = x_scaler.fit_transform(x_raw, bounds=bounds, log_scale=log_scale)
+            y = y_scaler.fit_transform(y_raw, bounds=None, log_scale=y_log_scale)
 
-        rng_key, rng_key_predict = gpax.utils.get_keys()
-        gp_model = gpax.ExactGP(kernel="Matern", input_dim=x.shape[1])
-        gp_model.fit(
-            rng_key,
-            X=x,
-            y=y,
-            progress_bar=True,
-            num_warmup=200,
-            num_samples=400,
-        )
+            rng_key, rng_key_predict = gpax.utils.get_keys()
+            gp_model = gpax.ExactGP(kernel="Matern", input_dim=x.shape[1])
+            gp_model.fit(
+                rng_key,
+                X=x,
+                y=y,
+                progress_bar=True,
+                num_warmup=400,
+                num_samples=800,
+            )
 
-        # Store for post-hoc analysis
-        self.model = gp_model
-        self._x_scaler = x_scaler
-        self._y_scaler = y_scaler
-        self._rng_key_predict = rng_key_predict
+            # Store for post-hoc analysis
+            self.model = gp_model
+            self._x_scaler = x_scaler
+            self._y_scaler = y_scaler
+            self._rng_key_predict = rng_key_predict
+
+            # If we're inside a batch selection loop, cache the fit so
+            # subsequent picks in the same batch skip MCMC.
+            if getattr(self, "_batch_fit_reuse", False):
+                self._cached_gp_fit = dict(
+                    gp_model=gp_model,
+                    x_scaler=x_scaler,
+                    y_scaler=y_scaler,
+                    rng_key_predict=rng_key_predict,
+                    x=x,
+                    y=y,
+                )
 
         x_grid_ctrl = self.x_unmeasured.copy()
         acquisition_used = self.acquisition_function
         current_xi = self._current_ei_xi()
 
         if len(self.bo_covariates) > 0:
-            # Robust acquisition: sample covariates from observed distribution
-            cov_samples_list = []
-            for covariate in self.bo_covariates:
-                cov_vals = np.asarray(df_results[covariate.name].values, dtype=float)
-                if cov_vals.size == 0:
-                    cov_samples = np.array([0.0])
-                else:
-                    cov_samples = self._rng.choice(
-                        cov_vals, size=self.n_cov_samples, replace=True
-                    )
-                cov_samples_list.append(cov_samples)
-
-            if len(cov_samples_list) == 1:
-                cov_grid = cov_samples_list[0].reshape(-1, 1)
-            else:
-                cov_mesh = np.meshgrid(*cov_samples_list, indexing="ij")
-                cov_grid = np.stack([m.ravel() for m in cov_mesh], axis=1)
+            # Robust acquisition: marginalise over observed covariate distribution
+            cov_grid = self._sample_covariate_grid(df_results)
 
             acq_values_total = self._compute_robust_acq(
                 rng_key_predict,
@@ -936,7 +1798,18 @@ class BOptGPAX(InterPhaseAgent):
                 )
 
             if self.acquisition_function == "ei":
-                best_f_scaled = jnp.max(y) if maximize else jnp.min(y)
+                # best_f from GP-predicted mean over grid (not observed
+                # max) — robust to single-point outliers.  See the
+                # comment in _compute_robust_acq for full rationale.
+                _mean_pred, _y_samp = gp_model.predict_in_batches(
+                    rng_key_predict,
+                    x_total_scaled,
+                    batch_size=1000,
+                    n=self.ei_num_samples,
+                    noiseless=self.ei_noiseless,
+                )
+                _grid_mean = jnp.mean(_y_samp, axis=(0, 1))
+                best_f_scaled = jnp.max(_grid_mean) if maximize else jnp.min(_grid_mean)
                 acq_values_total = self._compute_mc_ei(
                     rng_key_predict,
                     gp_model,
@@ -1001,6 +1874,35 @@ class BOptGPAX(InterPhaseAgent):
             for i, param in enumerate(self.parameters_to_optimize)
         }
 
+        # Stash the plot context so the batch caller can render a single
+        # diagnostic plot with all picks overlaid.  IMPORTANT: only stash
+        # on the FIRST call of a batch — i.e. when the GP fit cache is
+        # still empty.  Subsequent calls in the same batch have:
+        #   (a) inverse-distance penalty applied to the acquisition, and
+        #   (b) earlier picks removed from x_unmeasured,
+        # so their acquisition surfaces are warped and have holes where
+        # picks 1..i-1 used to be.  Stashing those would make the final
+        # overlay misleading: picks 1 and 2 would sit on zero-padded
+        # holes (rendered blue) instead of on the clean, unpenalised EI
+        # landscape that produced the batch in the first place.  Using
+        # the FIRST call's stash gives the intuitive view: clean EI
+        # landscape + 3 crosses showing where the greedy + diversity
+        # penalty ended up placing each batch pick.
+        if is_first_call_in_batch:
+            self._last_plot_context = dict(
+                df_results=df_results,
+                x_scaler=x_scaler,
+                y_scaler=y_scaler,
+                gp_model=gp_model,
+                rng_key_predict=rng_key_predict,
+                x_unmeasured_at_computation=x_grid_ctrl.copy(),
+                acq_values_total=np.asarray(acq_values_total),
+                acquisition_used=acquisition_used,
+                current_xi=current_xi,
+                cov_grid=cov_grid if len(self.bo_covariates) > 0 else None,
+                y=np.asarray(y),
+            )
+
         if verbose:
             self._plot_bo_landscape(
                 df_results,
@@ -1047,14 +1949,32 @@ class BOptGPAX(InterPhaseAgent):
         current_xi,
         cov_grid,
         y,
+        next_points=None,
+        prev_experiments=None,
     ):
         """Plot measured data, model predictions, and acquisition function.
 
         Creates 4 subplots:
         1. Measured points (x1, x2) with y as colour
         2. Ground truth (if available) or GP model uncertainty
-        3. Acquisition function
+        3. Acquisition function (with all batch picks annotated)
         4. GP predicted landscape
+
+        The figure is also saved to ``{storage_path}/figures/bo_iter_*.png``
+        so every phase is archived alongside the experiment data.
+
+        Args:
+            next_point: legacy single-pick annotation. Kept for backwards
+                compatibility with single-condition callers.
+            next_points: array of shape ``(n_picks, n_params)`` with every
+                pick made in the current phase. Takes priority over
+                ``next_point`` — used by batch BO to annotate all picks
+                (e.g. 3 cyan crosses when ``n_conditions_per_iter=3``).
+            prev_experiments: snapshot of ``x_performed_experiments`` from
+                BEFORE the current batch was picked. When provided, used
+                for the "Already measured" overlay so the current-phase
+                picks don't double up on both gray and cyan markers. Falls
+                back to ``self.x_performed_experiments`` if ``None``.
         """
         import jax.numpy as jnp
         import matplotlib.pyplot as plt
@@ -1063,35 +1983,58 @@ class BOptGPAX(InterPhaseAgent):
         unique_x1 = np.unique(x_total_ctrl[:, 0])
         unique_x2 = np.unique(x_total_ctrl[:, 1])
 
+        # Covariate samples for marginalisation.  Match what the BO
+        # acquisition does in _compute_robust_acq with cov_marginalization_mode
+        # 'joint': draw whole rows from df_results so cross-covariate
+        # correlations are preserved.  The previous implementation varied
+        # only the first covariate on a linspace and held the rest at their
+        # mean — inconsistent with the BO target and biased when covariates
+        # are correlated.
         if len(self.bo_covariates) > 0 and not df_results.empty:
-            cov_vals = np.asarray(
-                df_results[self.bo_covariates[0].name].values, dtype=float
-            )
-            cov_min = float(np.nanmin(cov_vals))
-            cov_max = float(np.nanmax(cov_vals))
-            cov_mean = float(np.nanmean(cov_vals))
-            n_cov_samples = 10
-            cov_samples = np.linspace(cov_min, cov_max, n_cov_samples)
+            cov_cols = [c.name for c in self.bo_covariates]
+            cov_vals_full = np.asarray(df_results[cov_cols].to_numpy(), dtype=float)
+            cov_mean = float(np.nanmean(cov_vals_full[:, 0]))
+            n_cov_samples = 50
+            _plot_rng = np.random.default_rng(0)
+            row_idx = _plot_rng.integers(0, cov_vals_full.shape[0], size=n_cov_samples)
+            cov_samples_joint = cov_vals_full[row_idx]  # (n_cov_samples, n_cov)
         else:
             cov_mean = 0.0
-            cov_samples = np.array([0.0])
             n_cov_samples = 1
+            cov_samples_joint = None
 
-        # Build grid for predictions
-        x_grid_full = []
-        for x1 in unique_x1:
-            for x2 in unique_x2:
-                for cov in cov_samples:
-                    x_grid_full.append(
-                        [x1, x2, cov] if len(self.bo_covariates) > 0 else [x1, x2]
-                    )
-        x_grid_full = np.array(x_grid_full)
+        # Build (x_ctrl, c) grid: repeat each (x1, x2) across every joint
+        # covariate sample.  Layout mirrors _compute_robust_acq so the
+        # reshape to (n_ctrl, n_cov) further down is unambiguous.
+        if len(self.bo_covariates) > 0 and cov_samples_joint is not None:
+            n_ctrl = len(unique_x1) * len(unique_x2)
+            ctrl_grid = np.array([[x1, x2] for x1 in unique_x1 for x2 in unique_x2])
+            x_grid_full = np.hstack(
+                [
+                    np.repeat(ctrl_grid, n_cov_samples, axis=0),
+                    np.tile(cov_samples_joint, (n_ctrl, 1)),
+                ]
+            )
+        else:
+            x_grid_full = np.array([[x1, x2] for x1 in unique_x1 for x2 in unique_x2])
 
         x_grid_scaled = x_scaler.transform(x_grid_full)
-        y_pred_scaled, y_samples_scaled = gp_model.predict(
-            rng_key_predict, x_grid_scaled, noiseless=True
+        # Batched prediction — ``gp_model.predict(...)`` would materialise
+        # a ``(num_mcmc, n_samples_per_draw, n_test)`` array of posterior
+        # samples in one shot; for a 10k-point (x, c) grid this blew up
+        # to >170 GB and OOM'd the GPU.  ``predict_in_batches`` streams
+        # the test grid in chunks, identical API as used by
+        # ``_compute_robust_acq``.
+        y_pred_scaled, y_samples_scaled = gp_model.predict_in_batches(
+            rng_key_predict,
+            x_grid_scaled,
+            batch_size=1000,
+            n=self.ei_num_samples,
+            noiseless=True,
         )
-        y_pred = y_scaler.inverse_transform(y_pred_scaled).flatten()
+        y_pred = y_scaler.inverse_transform(
+            np.asarray(y_pred_scaled).reshape(-1, 1)
+        ).flatten()
 
         y_std_scaled = jnp.std(y_samples_scaled, axis=(0, 1))
         y_std = np.asarray(y_std_scaled) * float(jnp.abs(y_scaler.std_[0]))
@@ -1169,15 +2112,25 @@ class BOptGPAX(InterPhaseAgent):
                     ]
                 )
                 for (x1, x2), group in grouped:
-                    cov_val = group[self.bo_covariates[0].name].mean()
+                    # One line per covariate: shows the mean of the FOV
+                    # observations at this (x1, x2) condition so the
+                    # viewer can see what covariate context the GP has
+                    # for each measured point.  FOVs are fed to the GP
+                    # as individual observations (not aggregated), so
+                    # these means are display-only — the GP itself sees
+                    # the within-condition spread.
+                    lines = [
+                        f"{cov.name}={group[cov.name].mean():.1f}"
+                        for cov in self.bo_covariates
+                    ]
                     ax1.annotate(
-                        f"{cov_val:.2f}",
+                        "\n".join(lines),
                         xy=(x1, x2),
                         xytext=(0, 8),
                         textcoords="offset points",
                         ha="center",
                         va="bottom",
-                        fontsize=8,
+                        fontsize=7,
                         bbox=dict(
                             boxstyle="round,pad=0.2", facecolor="white", alpha=0.7
                         ),
@@ -1240,13 +2193,19 @@ class BOptGPAX(InterPhaseAgent):
         # Subplot 3: Acquisition Function
         ax3 = axes[1, 0]
         ax3.pcolormesh(X_mesh, Y_mesh, acq_2d, cmap="coolwarm", shading="nearest")
-        if (
-            self.x_performed_experiments is not None
-            and len(self.x_performed_experiments) > 0
-        ):
+
+        # "Already measured" overlay — prefer the pre-batch snapshot so
+        # current-phase picks don't show up on BOTH gray and cyan markers.
+        _prev = (
+            prev_experiments
+            if prev_experiments is not None
+            else self.x_performed_experiments
+        )
+        if _prev is not None and len(_prev) > 0:
+            _prev_arr = np.asarray(_prev)
             ax3.scatter(
-                self.x_performed_experiments[:, 0],
-                self.x_performed_experiments[:, 1],
+                _prev_arr[:, 0],
+                _prev_arr[:, 1],
                 c="gray",
                 s=80,
                 marker="x",
@@ -1255,16 +2214,28 @@ class BOptGPAX(InterPhaseAgent):
                 alpha=0.6,
                 zorder=2,
             )
-        if next_point is not None:
+
+        # Current-phase picks — `next_points` (plural) takes priority so
+        # batch BO can show all n_conditions_per_iter picks as cyan crosses.
+        _picks = None
+        if next_points is not None and len(next_points) > 0:
+            _picks = np.asarray(next_points, dtype=float).reshape(
+                -1, len(self.parameters_to_optimize)
+            )
+        elif next_point is not None:
+            _picks = np.asarray(next_point, dtype=float).reshape(
+                1, len(self.parameters_to_optimize)
+            )
+        if _picks is not None and len(_picks) > 0:
             ax3.scatter(
-                float(next_point[0]),
-                float(next_point[1]),
+                _picks[:, 0],
+                _picks[:, 1],
                 c="cyan",
                 s=220,
                 marker="X",
                 edgecolors="black",
                 linewidths=1.5,
-                label="Chosen next",
+                label=f"Chosen next ({len(_picks)})",
                 zorder=4,
             )
         ax3.legend()
@@ -1331,6 +2302,21 @@ class BOptGPAX(InterPhaseAgent):
             cax=cbar_ax,
             label=self.objective_metric.name,
         )
+
+        # Persist the figure to {storage_path}/figures/ so every BO phase
+        # is archived alongside the experiment data. Errors here should
+        # never interrupt the experiment loop — log and continue.
+        try:
+            figures_dir = os.path.join(self.storage_path, "figures")
+            os.makedirs(figures_dir, exist_ok=True)
+            fig_path = os.path.join(
+                figures_dir, f"bo_iter_{self.iteration + 1:03d}.png"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            print(f"  Saved BO diagnostic plot to {fig_path}")
+        except Exception as exc:  # pragma: no cover - best-effort
+            print(f"  Warning: could not save BO plot: {exc}")
+
         plt.show()
 
 

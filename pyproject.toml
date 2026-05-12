@@ -72,6 +72,22 @@ api75 = [
     "pymmcore==12.2.2.75.0"
 ]
 
+gpax = [
+    "gpax",
+    "joblib",
+    "xgboost",
+    "scikit-learn"
+]
+
+botorch = [
+    "botorch",
+    "gpytorch",
+    "torch",
+    "joblib",
+    "xgboost",
+    "scikit-learn",
+]
+
 
 [[tool.uv.index]]
 # CUDA 13.0 wheels. Requires NVIDIA driver >= 580.65.
