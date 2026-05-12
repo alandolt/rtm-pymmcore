@@ -94,13 +94,15 @@ class FE_ErkKtr(FeatureExtractor):
         table = table_nuc.merge(table_ring, on=["label"])
 
         # CALCULATE the ERK ratio
-        table["cnr"] = table["mean_intensity_C1_ring"] / table["mean_intensity_C1_nuc"]
-        table["cnr_median"] = (
+        table["cnr_mean"] = (
+            table["mean_intensity_C1_ring"] / table["mean_intensity_C1_nuc"]
+        )
+        table["cnr"] = (
             table["median_intensity_C1_ring"] / table["median_intensity_C1_nuc"]
         )
 
+        table["cnr_mean"] = table["cnr_mean"].astype(np.float32)
         table["cnr"] = table["cnr"].astype(np.float32)
-        table["cnr_median"] = table["cnr_median"].astype(np.float32)
         table["area_nuc"] = table["area_nuc"].astype(np.float32)
 
         return table, [{self.name_extra_mask: labels_ring}]
