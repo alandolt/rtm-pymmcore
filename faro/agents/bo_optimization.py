@@ -17,7 +17,6 @@ so that importing this module without them installed does not crash).
 from __future__ import annotations
 
 import dataclasses
-import time
 from abc import abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -467,22 +466,7 @@ class BOptGPAX(InterPhaseAgent):
 
         self.controller.finish_experiment()
 
-    def _wait_for_pipeline(self, timeout: float = 120):
-        """Block until the Analyzer has drained its queues."""
-        analyzer = self.controller._analyzer
-        if analyzer is None:
-            return
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if (
-                analyzer._storage_queue.qsize() == 0
-                and analyzer._deferred_queue.qsize() == 0
-            ):
-                with analyzer.task_lock:
-                    if analyzer.active_pipeline_tasks == 0:
-                        return
-            time.sleep(0.5)
-        print("[BOptGPAX] Warning: _wait_for_pipeline timed out after " f"{timeout}s")
+    # _wait_for_pipeline is inherited from InterPhaseAgent
 
     # ------------------------------------------------------------------
     # EI exploration decay
