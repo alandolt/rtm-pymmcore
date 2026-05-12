@@ -1016,7 +1016,9 @@ class FOVFinderAgent(PreExperimentAgent):
                 )
                 wells_for_positions.append(well)
 
-        # Print per-selected-FOV cell counts
+        # Print per-selected-FOV cell counts (and per-condition stats when
+        # fov_conditions are configured, so the user can see the mean of
+        # each selection feature alongside the cell count).
         print(f"[FOVFinderAgent] Phase {phase} — selected FOVs:")
         for fp, w in zip(selected, wells_for_positions):
             row = df_scan[
@@ -1029,7 +1031,39 @@ class FOVFinderAgent(PreExperimentAgent):
             tag = (
                 "" if valid is True else " (below min_cells)" if valid is False else ""
             )
-            print(f"    {fp.name}: {n} cells{tag}")
+
+            # Per-condition stats: mean of the feature across cells AND the
+            # fraction of cells that satisfied the threshold.  Both columns
+            # are populated by _segment_and_score whenever fov_conditions
+            # is non-empty; missing/NaN values fall back gracefully.
+            extras: list[str] = []
+            if not row.empty:
+                for cond in self.fov_conditions:
+                    mean_col = f"fe_{cond.feature}_mean"
+                    frac_col = f"cond_{cond.feature}_{cond.operator}_frac"
+                    mean_val = (
+                        float(row[mean_col].iloc[0])
+                        if mean_col in row.columns and pd.notna(row[mean_col].iloc[0])
+                        else None
+                    )
+                    frac_val = (
+                        float(row[frac_col].iloc[0])
+                        if frac_col in row.columns and pd.notna(row[frac_col].iloc[0])
+                        else None
+                    )
+                    if mean_val is None and frac_val is None:
+                        continue
+                    parts: list[str] = []
+                    if mean_val is not None:
+                        parts.append(f"mean={mean_val:.3f}")
+                    if frac_val is not None:
+                        parts.append(
+                            f"{int(round(frac_val * 100))}% "
+                            f"{cond.operator} {cond.threshold:g}"
+                        )
+                    extras.append(f"{cond.feature}({', '.join(parts)})")
+            extras_str = ("  " + "  ".join(extras)) if extras else ""
+            print(f"    {fp.name}: {n} cells{extras_str}{tag}")
 
         if self.verbose:
             self._debug_show_well_summary(
