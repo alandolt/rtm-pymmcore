@@ -977,6 +977,21 @@ class FOVFinderAgent(PreExperimentAgent):
                 )
                 wells_for_positions.append(well)
 
+        # Print per-selected-FOV cell counts
+        print(f"[FOVFinderAgent] Phase {phase} — selected FOVs:")
+        for fp, w in zip(selected, wells_for_positions):
+            row = df_scan[
+                (df_scan["well"] == w)
+                & (np.isclose(df_scan["x"], fp.x))
+                & (np.isclose(df_scan["y"], fp.y))
+            ]
+            n = int(row["n_cells"].iloc[0]) if not row.empty else "?"
+            valid = bool(row["valid"].iloc[0]) if not row.empty else "?"
+            tag = (
+                "" if valid is True else " (below min_cells)" if valid is False else ""
+            )
+            print(f"    {fp.name}: {n} cells{tag}")
+
         if self.verbose:
             self._debug_show_well_summary(
                 wells, df_scan, selected, wells_for_positions, phase
