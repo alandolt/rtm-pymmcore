@@ -533,10 +533,26 @@ class ImageProcessingPipeline:
 
         if frame_idx % self.only_save_every_n_frames == 0 or frame_idx == 0:
             with fov_obj.parquet_lock:
-                df_to_save.to_parquet(
-                    os.path.join(self.storage_path, "tracks", filename_for_parquet),
-                    compression="zstd",
+                _parquet_path = os.path.join(
+                    self.storage_path, "tracks", filename_for_parquet
                 )
+                df_to_save.to_parquet(_parquet_path, compression="zstd")
+                # fsync the parquet write so the agent's read_tracks() right
+                # after _wait_for_pipeline() doesn't race against the OS
+                # write buffer.  pyarrow.to_parquet returns once the file
+                # handle is closed, but the bytes can still sit in the page
+                # cache for hundreds of ms; without fsync the last FOV's
+                # ref-frame parquet often appears to be missing
+                # ref_mean_intensity (NaN for every cell), which the BO
+                # agents misinterpret as "no optoRTK signal" and skip.
+                # Cost is one fsync per parquet save -- in practice << 1 ms
+                # on warm disks, and only happens every
+                # only_save_every_n_frames frames.
+                try:
+                    with open(_parquet_path, "rb") as _f:
+                        os.fsync(_f.fileno())
+                except OSError:
+                    pass
 
         w = self._writer
         if self.stimulator is not None:
