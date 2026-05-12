@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from rtm_pymmcore.agents.base import IntraExperimentAgent
-from rtm_pymmcore.core.data_structures import Channel, RTMSequence
+from faro.agents.base import IntraExperimentAgent
+from faro.core.data_structures import Channel, RTMSequence
 
 
 class AdaptiveFrequencyAgent(IntraExperimentAgent):

@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 if TYPE_CHECKING:
-    from rtm_pymmcore.core.controller import Controller
-    from rtm_pymmcore.microscope.base import AbstractMicroscope
+    from faro.core.controller import Controller
+    from faro.microscope.base import AbstractMicroscope
 
 
 class Agent(ABC):
@@ -78,6 +78,12 @@ class InterPhaseAgent(Agent):
     Owns the experiment loop: calls ``controller.run_experiment()`` /
     ``continue_experiment()`` / ``finish_experiment()`` and reads
     pipeline results from parquet between phases.
+
+    Implementations may expose :meth:`run_one_phase` so they can be driven
+    externally — e.g. wrapped by :class:`ComposedAgent` to interleave
+    pre-phase work (FOV finding, focus, calibration) between phases.
+    Subclasses that override ``run()`` to do their own loop should also
+    factor that loop body into ``run_one_phase`` so composition works.
     """
 
     def __init__(self, storage_path: str):
@@ -103,6 +109,46 @@ class InterPhaseAgent(Agent):
             return pd.read_parquet(path)
         except FileNotFoundError:
             return pd.DataFrame()
+
+    def run_one_phase(
+        self,
+        phase_id: int,
+        fov_positions: list | None = None,
+        fovs: list[int] | None = None,
+    ) -> dict | None:
+        """Run a single phase of the multi-phase experiment.
+
+        Default implementation raises :class:`NotImplementedError`.
+        Subclasses that want to be composable (driven by
+        :class:`ComposedAgent`) should override this method to:
+
+        1. Update internal FOV state from *fov_positions* / *fovs*.
+        2. Decide what to acquire next (parameters, events).
+        3. Call ``controller.run_experiment()`` (first phase) or
+           ``controller.continue_experiment()`` (later phases).
+        4. Wait for the pipeline to drain.
+        5. Read tracks, update internal state, and return any result.
+
+        Args:
+            phase_id: Zero-based phase index.  Implementations should use
+                this to decide between ``run_experiment`` (==0) and
+                ``continue_experiment`` (>0).
+            fov_positions: Optional list of stage positions for this
+                phase (e.g. ``FovPosition`` namedtuples produced by a
+                :class:`PreExperimentAgent`).  May be ``None`` when the
+                inner agent already knows its FOVs.
+            fovs: Optional list of FOV indices to use for this phase.
+                If ``None``, the implementation should derive them from
+                ``fov_positions`` (typically ``range(len(fov_positions))``).
+
+        Returns:
+            Optional result dict (e.g. ``{"df_new": ..., "params": ...}``)
+            so callers can inspect per-phase outputs.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement run_one_phase(); "
+            "override it to make this agent composable."
+        )
 
 
 class IntraExperimentAgent(Agent):

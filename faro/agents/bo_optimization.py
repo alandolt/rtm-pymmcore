@@ -24,10 +24,10 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import pandas as pd
 
-from rtm_pymmcore.agents.base import InterPhaseAgent
+from faro.agents.base import InterPhaseAgent
 
 if TYPE_CHECKING:
-    from rtm_pymmcore.core.data_structures import RTMEvent
+    from faro.core.data_structures import RTMEvent
 
 
 # ---------------------------------------------------------------------------
@@ -298,16 +298,111 @@ class BOptGPAX(InterPhaseAgent):
         ...
 
     # ------------------------------------------------------------------
-    # Main experiment loop
+    # Per-phase API (composable) + main experiment loop
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
-        """Execute the BO experiment loop.
+    def _ensure_results_df(self) -> None:
+        """Lazily create the per-instance results DataFrame."""
+        if not hasattr(self, "df_results") or self.df_results is None:
+            self.df_results = pd.DataFrame()
 
-        1. Run ``k=4`` initial samples spread across the parameter space.
-        2. For each BO iteration: fit GP, compute acquisition, select next
-           point, run experiment, collect results.
-        3. Call ``controller.finish_experiment()`` at the end.
+    def run_one_phase(
+        self,
+        phase_id: int,
+        fov_positions: list | None = None,
+        fovs: list[int] | None = None,
+    ) -> dict | None:
+        """Run a single BO phase.
+
+        For single-condition BO this is one BO iteration: pick the next
+        parameter set (initial spread for early phases, GP-acquisition
+        otherwise), build events, run/continue the experiment, wait for
+        the pipeline, read tracks and append observations to
+        :attr:`df_results`.
+
+        This method is the primary integration point for
+        :class:`ComposedAgent` — composing BO with a per-phase
+        :class:`PreExperimentAgent` (e.g. ``FOVFinderAgent``) just means
+        calling ``finder.run()`` and then this method in a loop.
+
+        Args:
+            phase_id: Zero-based phase index.  ``phase_id == 0`` triggers
+                ``controller.run_experiment``; later phases use
+                ``continue_experiment``.
+            fov_positions: Optional list of stage positions for this
+                phase.  When provided, replaces the agent's current FOVs.
+            fovs: Optional list of FOV indices.  Defaults to
+                ``range(len(fov_positions))`` when *fov_positions* is given.
+
+        Returns:
+            ``{"params": ..., "df_new": ..., "phase_id": phase_id}`` or
+            ``None`` if no results were produced.
+        """
+        self._ensure_results_df()
+
+        # Update FOVs if positions were supplied for this phase.
+        if fov_positions is not None:
+            self.fov_positions = list(fov_positions)
+            if fovs is None:
+                fovs = list(range(len(fov_positions)))
+            self.add_fovs(fovs)
+
+        if not self.fovs:
+            raise ValueError(
+                "No FOVs configured. Call add_fovs() before run_one_phase(), "
+                "or pass fov_positions=... to this call."
+            )
+
+        # --- Pick next parameter set ----------------------------------
+        if self.df_results.empty or len(self.df_results) < 4:
+            initial, _ = self._select_initial_samples(k=1)
+            if isinstance(initial, dict):
+                params = initial
+            else:
+                params = initial[0]
+            print(f"=== Phase {phase_id}: initial sample {params} ===")
+        else:
+            params = self._determine_next_parameters(
+                self.df_results, verbose=self.verbose
+            )
+            print(f"=== Phase {phase_id}: BO-selected {params} ===")
+
+        # --- Build events and run -------------------------------------
+        events = self._create_events_for_cycle(params)
+        if phase_id == 0:
+            self.controller.run_experiment(events, validate=False)
+        else:
+            self.controller.continue_experiment(events, validate=False)
+
+        # --- Wait + collect results -----------------------------------
+        self._wait_for_pipeline()
+        tracks = {fov: self.read_tracks(fov) for fov in self.fovs}
+        df_new = self._preprocess_results(tracks)
+        if not df_new.empty:
+            self.df_results = pd.concat([self.df_results, df_new], ignore_index=True)
+            self._iteration_means.append(
+                float(df_new[self.objective_metric.name].mean())
+            )
+
+        if not self.df_results.empty:
+            self.x = self._extract_x_from_df(self.df_results)
+            self.y = self._extract_y_from_df(self.df_results)
+
+        self.iteration += 1
+        return {"params": params, "df_new": df_new, "phase_id": phase_id}
+
+    def run(self) -> None:
+        """Execute the full BO experiment loop.
+
+        Convenience wrapper that calls :meth:`run_one_phase` for the
+        configured number of iterations and then finalises the
+        controller.  Equivalent to:
+
+        .. code-block:: python
+
+            for k in range(self.n_iterations + 1):
+                agent.run_one_phase(k)
+            agent.controller.finish_experiment()
 
         Raises:
             ValueError: If no FOVs have been configured via :meth:`add_fovs`.
@@ -315,12 +410,13 @@ class BOptGPAX(InterPhaseAgent):
         if not self.fovs:
             raise ValueError("No FOVs configured. Call add_fovs() before run().")
 
-        df_results = pd.DataFrame()
-
+        # Initial samples spread across the parameter space.
         initial_parameters, _ = self._select_initial_samples(k=4)
-
         if isinstance(initial_parameters, dict):
             initial_parameters = [initial_parameters]
+
+        df_results = pd.DataFrame()
+        self.df_results = df_results
 
         for i, params in enumerate(initial_parameters):
             print(
@@ -341,6 +437,7 @@ class BOptGPAX(InterPhaseAgent):
                 self._iteration_means.append(
                     float(df_new_results[self.objective_metric.name].mean())
                 )
+            self.df_results = df_results
 
         for e in range(self.n_iterations):
             print(f"\n=== BO Iteration {e + 1}/{self.n_iterations} ===")
@@ -360,6 +457,7 @@ class BOptGPAX(InterPhaseAgent):
                     float(df_new_results[self.objective_metric.name].mean())
                 )
             self.iteration += 1
+            self.df_results = df_results
 
         # Store final results for external access
         if not df_results.empty:
