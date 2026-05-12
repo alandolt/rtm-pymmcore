@@ -38,6 +38,16 @@ if TYPE_CHECKING:
     import matplotlib.pyplot as plt  # noqa: F401
 
 
+# Hardware floor for a single stim pulse.  Pulses with computed exposure
+# below this value are dropped from the RTMSequence in
+# :meth:`OscillationBO._create_events_for_batch` — the microscope cannot
+# reliably deliver very short pulses (sub-25 ms tends to be unreliable
+# on the Jungfrau setup, and 0 ms either errors at the device layer or
+# silently no-ops, both of which break the light-budget invariant in
+# the v9 reparameterisation).
+MIN_STIM_EXPOSURE_MS: float = 25.0
+
+
 class OscillationBO(BOptGPAX):
     """Batch BO agent for ERK oscillation optimisation.
 
@@ -262,13 +272,50 @@ class OscillationBO(BOptGPAX):
             # additional control axis by declaring
             # ``BO_Parameter(name="pulse_interval", ...)`` in the notebook.
             pulse_interval = max(1, int(params.get("pulse_interval", 1)))
-            stim_frames = range(
-                self.first_frame_stim,
-                self.last_frame_stim,
-                pulse_interval,
+            all_frames = list(
+                range(
+                    self.first_frame_stim,
+                    self.last_frame_stim,
+                    pulse_interval,
+                )
             )
-            n_stim_frames = len(stim_frames)
-            exposures = tuple(base_exp + ramp * i for i in range(n_stim_frames))
+            all_exposures = [base_exp + ramp * i for i in range(len(all_frames))]
+
+            # Drop any pulse whose computed exposure is below 1 ms.  The
+            # microscope cannot reliably deliver a sub-millisecond (or 0 ms)
+            # light pulse — at the hardware layer this either errors or
+            # silently skips the channel, which would also break the
+            # light-budget invariant downstream.  v9's light_budget
+            # reparameterisation can produce sub-1 ms pulses at the
+            # extreme corners (low budget + high ramp_fraction + small
+            # pulse_interval), so we filter here so no stim event fires
+            # on those frames.  v6/v7/v8 conditions all keep base_exp ≥
+            # min grid value (e.g. 20 ms), so the filter is a no-op for
+            # those callers.
+            kept = [
+                (f, e)
+                for f, e in zip(all_frames, all_exposures)
+                if e >= MIN_STIM_EXPOSURE_MS
+            ]
+            n_dropped = len(all_frames) - len(kept)
+            if n_dropped > 0:
+                print(
+                    f"  Cond {cond_idx}: dropped {n_dropped}/{len(all_frames)} "
+                    f"sub-{MIN_STIM_EXPOSURE_MS:g}ms pulses "
+                    f"(min computed exposure was {min(all_exposures):.3f} ms)"
+                )
+
+            if not kept:
+                print(
+                    f"  Cond {cond_idx}: ALL {len(all_frames)} pulses below "
+                    f"{MIN_STIM_EXPOSURE_MS:g} ms — emitting NO stim events "
+                    f"for this condition (imaging only)"
+                )
+                stim_frames = frozenset()
+                exposures = ()
+            else:
+                stim_frames = frozenset(f for f, _ in kept)
+                exposures = tuple(e for _, e in kept)
 
             acq = RTMSequence(
                 time_plan={
