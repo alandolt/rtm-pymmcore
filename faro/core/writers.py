@@ -200,10 +200,12 @@ def _derive_direct_axes(n_pos: int) -> list[str]:
 def _growable_dim_indices(axis_keys: list[str]) -> tuple[int, ...]:
     """Indices (within ``axis_keys``) of axes that can grow on write.
 
-    Only ``t`` is unbounded in practice; other FARO dimensions are fixed
-    by the event list at open time.
+    ``t`` is unbounded in practice. ``p`` is also growable to support
+    phased experiments (e.g. batch BO via ``ComposedAgent``) where new
+    FOV indices appear after ``init_stream`` — the controller sizes
+    the array for phase 0's FOVs only.
     """
-    return tuple(i for i, k in enumerate(axis_keys) if k == Axis.TIME)
+    return tuple(i for i, k in enumerate(axis_keys) if k in (Axis.TIME, Axis.POSITION))
 
 
 class OmeZarrRawReader:
@@ -639,9 +641,7 @@ class OmeZarrWriter:
 
     def _leading_index(self, metadata: dict) -> tuple[int, ...]:
         """Build the leading index tuple for a direct-mode write."""
-        return tuple(
-            metadata.get(_META_KEY.get(k, k), 0) for k in self._axis_keys
-        )
+        return tuple(metadata.get(_META_KEY.get(k, k), 0) for k in self._axis_keys)
 
     def _maybe_resize_leading(self, arr, leading_idx: tuple[int, ...]) -> None:
         """Grow any growable leading axis that the incoming write exceeds."""
@@ -661,6 +661,13 @@ class OmeZarrWriter:
                     changed = True
             if changed:
                 arr.resize(tuple(cur))
+                # Keep _position_names in sync when the position axis grows,
+                # so consumers reading len(self._position_names) see the
+                # actual array size (e.g. _write_label's has_pos_axis check).
+                if Axis.POSITION in self._axis_keys:
+                    p_dim = self._axis_keys.index(Axis.POSITION)
+                    while len(self._position_names) < cur[p_dim]:
+                        self._position_names.append(f"Pos{len(self._position_names)}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -845,7 +852,9 @@ class OmeZarrWriter:
         self._maybe_resize_leading(arr, leading_idx)
 
         if img.ndim == 3:
-            arr[leading_idx + (slice(None, img.shape[0]), slice(None), slice(None))] = img
+            arr[leading_idx + (slice(None, img.shape[0]), slice(None), slice(None))] = (
+                img
+            )
         elif img.ndim == 2:
             arr[leading_idx + (0, slice(None), slice(None))] = img
         self._raw_max_t = max(self._raw_max_t, metadata.get("timestep", 0))
@@ -864,11 +873,17 @@ class OmeZarrWriter:
             self._maybe_resize_leading(self._raw_array, leading_idx)
             stim_start = self._n_imaging_channels
             if frame.ndim == 2:
-                self._raw_array[leading_idx + (stim_start, slice(None), slice(None))] = frame
+                self._raw_array[
+                    leading_idx + (stim_start, slice(None), slice(None))
+                ] = frame
             else:
                 self._raw_array[
                     leading_idx
-                    + (slice(stim_start, stim_start + frame.shape[0]), slice(None), slice(None))
+                    + (
+                        slice(stim_start, stim_start + frame.shape[0]),
+                        slice(None),
+                        slice(None),
+                    )
                 ] = frame
             return
 
