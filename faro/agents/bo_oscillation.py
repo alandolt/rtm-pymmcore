@@ -24,6 +24,7 @@ inheritance to use the variational sparse GP backend instead of ExactGP.
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -485,6 +486,12 @@ class OscillationBO(BOptGPAX):
         """
         phase_id = self._current_phase_id
         results = []
+        # Diagnostic counters for the optoRTK re-read race-condition retry.
+        # Surfaces in the phase-end summary so we can tell whether the
+        # producer-side flush is the dominant cause of "FOV has no valid
+        # optoRTK" warnings or if some FOVs really had no ref signal.
+        n_optortk_retried = 0
+        n_optortk_recovered = 0
         for fov_idx, df_tracks in fov_tracks.items():
             if df_tracks.empty or "particle" not in df_tracks.columns:
                 continue
@@ -681,6 +688,45 @@ class OscillationBO(BOptGPAX):
             optortk_expression = (
                 float(np.mean(optortk_vals)) if len(optortk_vals) > 0 else 0.0
             )
+
+            # Race-condition retry: when the agent reads tracks immediately
+            # after acquisition, the last FOV(s) of the phase frequently
+            # have ref_mean_intensity all-NaN because the parquet write
+            # for that FOV's final (ref) frame has not been fsync'd to
+            # disk yet — _wait_for_pipeline only drains the in-memory
+            # queue, not the OS write buffer.  Sleep briefly and re-read
+            # the parquet once before giving up.  Cheap: only fires when
+            # the FOV would have been discarded anyway.
+            if not np.isfinite(optortk_expression) or optortk_expression <= 0.0:
+                n_optortk_retried += 1
+                time.sleep(1.0)
+                try:
+                    df_retry = self.read_tracks(fov_idx, phase_id=phase_id)
+                except Exception:
+                    df_retry = pd.DataFrame()
+                if "phase_id" in df_retry.columns:
+                    df_retry = df_retry[df_retry["phase_id"] == phase_id]
+                if not df_retry.empty and "ref_mean_intensity" in df_retry.columns:
+                    ref_rows_retry = df_retry.dropna(subset=["ref_mean_intensity"])
+                    if not ref_rows_retry.empty:
+                        optortk_vals_retry = (
+                            ref_rows_retry.groupby("particle")["ref_mean_intensity"]
+                            .first()
+                            .values
+                        )
+                        if len(optortk_vals_retry) > 0:
+                            expr_retry = float(np.mean(optortk_vals_retry))
+                            if np.isfinite(expr_retry) and expr_retry > 0.0:
+                                optortk_vals = optortk_vals_retry
+                                optortk_expression = expr_retry
+                                n_optortk_recovered += 1
+                                print(
+                                    f"  Recovered optoRTK for FOV "
+                                    f"{fov_idx} after 1.0 s re-read "
+                                    f"({len(optortk_vals)} cells, "
+                                    f"mean={optortk_expression:.3f})"
+                                )
+
             # Skip FOVs without a positive optoRTK reading: if the user
             # declares `BO_Covariate(..., log_scale=True)` the GP scaler
             # takes log() of this column, and log(0) -> -inf corrupts
@@ -732,6 +778,13 @@ class OscillationBO(BOptGPAX):
             f"mean frac_oscillating={df['frac_oscillating'].mean():.4f}, "
             f"max={df['frac_oscillating'].max():.4f}"
         )
+        if n_optortk_retried > 0:
+            n_lost = n_optortk_retried - n_optortk_recovered
+            print(
+                f"  optoRTK re-read retry: recovered "
+                f"{n_optortk_recovered}/{n_optortk_retried} FOVs "
+                f"({n_lost} still skipped)"
+            )
         return df
 
     # ------------------------------------------------------------------
