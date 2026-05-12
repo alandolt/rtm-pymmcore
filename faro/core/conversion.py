@@ -10,6 +10,7 @@ Includes:
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
@@ -217,19 +218,48 @@ def _dict_to_event(d: dict) -> RTMEvent:
 
 
 def save_events_json(path: str, events) -> None:
-    """Save a list of RTMEvents to ``<path>/events.json``."""
+    """Save a list of RTMEvents to ``<path>/events.json.gz``.
+
+    Output is gzipped (typically ~8–10× smaller than uncompressed) but
+    retains ``indent=2`` so it stays human-readable when piped through
+    ``zcat`` / ``gunzip -c`` / Python's ``gzip`` module — useful for
+    debugging without sacrificing disk footprint.
+
+    Files are written with ``.json.gz`` suffix.  The legacy
+    ``events.json`` (uncompressed) is no longer produced; use
+    :func:`load_events_json` to read either format transparently.
+    """
     data = [_event_to_dict(ev) for ev in events]
-    filepath = os.path.join(path, "events.json")
+    filepath = os.path.join(path, "events.json.gz")
     os.makedirs(path, exist_ok=True)
-    with open(filepath, "w") as f:
+    # compresslevel=6 is the gzip default and a good speed/ratio knob;
+    # the JSON-write+compress is dwarfed by the wet-lab time anyway, so
+    # don't bother tuning down for speed.
+    with gzip.open(filepath, "wt", encoding="utf-8", compresslevel=6) as f:
         json.dump(data, f, indent=2)
 
 
 def load_events_json(path: str) -> list[RTMEvent]:
-    """Load a list of RTMEvents from ``<path>/events.json``."""
-    filepath = os.path.join(path, "events.json")
-    with open(filepath) as f:
-        data = json.load(f)
+    """Load a list of RTMEvents from ``<path>``.
+
+    Tries ``events.json.gz`` first (the new default written by
+    :func:`save_events_json`), then falls back to the legacy
+    uncompressed ``events.json`` so on-disk runs from before the
+    gzip switch still load.
+    """
+    gz_path = os.path.join(path, "events.json.gz")
+    raw_path = os.path.join(path, "events.json")
+    if os.path.exists(gz_path):
+        with gzip.open(gz_path, "rt", encoding="utf-8") as f:
+            data = json.load(f)
+    elif os.path.exists(raw_path):
+        with open(raw_path) as f:
+            data = json.load(f)
+    else:
+        raise FileNotFoundError(
+            f"No events file in {path!r}: expected either "
+            f"events.json.gz (preferred) or events.json (legacy)."
+        )
     return [_dict_to_event(d) for d in data]
 
 

@@ -1036,10 +1036,16 @@ class Controller:
                     events_dir = os.path.join(self._writer.storage_path, "events")
                     os.makedirs(events_dir, exist_ok=True)
                     save_events_json(events_dir, events)
-                    src = os.path.join(events_dir, "events.json")
-                    dst = os.path.join(events_dir, f"events_phase_{phase_id:03d}.json")
-                    if os.path.exists(src):
-                        os.replace(src, dst)
+                    # save_events_json writes events.json.gz; rename to the
+                    # phase-tagged copy (fall back to the legacy .json name).
+                    for ext in (".json.gz", ".json"):
+                        src = os.path.join(events_dir, f"events{ext}")
+                        if os.path.exists(src):
+                            dst = os.path.join(
+                                events_dir, f"events_phase_{phase_id:03d}{ext}"
+                            )
+                            os.replace(src, dst)
+                            break
 
             if (
                 not is_continue
