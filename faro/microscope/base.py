@@ -31,9 +31,9 @@ class AbstractMicroscope:
         "*.debug=false; *.warning=false"  # Fix to suppress PyQT warnings from napari-micromanager when running in a Jupyter notebook
     )
 
-    dmd = None                      # optional DMD device
-    use_autofocus_event = False     # optional autofocus
-    dmd_needs_to_be_waken = False   # optional DMD wake
+    dmd = None  # optional DMD device
+    use_autofocus_event = False  # optional autofocus
+    dmd_needs_to_be_waken = False  # optional DMD wake
 
     def __init__(self):
         self.dmd = None
@@ -54,13 +54,26 @@ class AbstractMicroscope:
         """Connect frameReady callback: callback(img, event)."""
         raise NotImplementedError
 
-    def disconnect_frame(self, callback: Callable[[np.ndarray, MDAEvent], None]) -> None:
+    def disconnect_frame(
+        self, callback: Callable[[np.ndarray, MDAEvent], None]
+    ) -> None:
         """Disconnect frameReady callback."""
         raise NotImplementedError
 
     def cancel_mda(self) -> None:
         """Cancel running MDA."""
         raise NotImplementedError
+
+    def get_focus(self) -> float | None:
+        """Return the current focus (Z) stage position in µm, if available.
+
+        Microscope-agnostic accessor used by agents that need to snapshot
+        the current focus without reaching into a backend-specific API
+        (e.g. ``mmc.getPosition()``).  Subclasses should override.  The
+        base implementation returns ``None`` to signal "focus readout not
+        supported on this backend".
+        """
+        return None
 
     def resolve_group(self, config_name) -> str:
         """Return channel group for config name. Optional override."""
