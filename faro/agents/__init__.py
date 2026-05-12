@@ -6,7 +6,6 @@ from faro.agents.base import (
     PreExperimentAgent,
 )
 from faro.agents.bo_dose_response import DoseResponseBO
-from faro.agents.bo_dose_response_mt import MultiTaskDoseResponseBO
 from faro.agents.bo_oscillation import OscillationBO
 from faro.agents.composed import ComposedAgent
 from faro.agents.condition_monitor import ConditionMonitorAgent
@@ -30,7 +29,6 @@ __all__ = [
     "FOVFinderAgent",
     "IntraExperimentAgent",
     "InterPhaseAgent",
-    "MultiTaskDoseResponseBO",
     "OscillationBO",
     "OscillationBOBoTorch",
     "PreExperimentAgent",
