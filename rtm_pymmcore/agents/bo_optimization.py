@@ -308,7 +308,13 @@ class BOptGPAX(InterPhaseAgent):
         2. For each BO iteration: fit GP, compute acquisition, select next
            point, run experiment, collect results.
         3. Call ``controller.finish_experiment()`` at the end.
+
+        Raises:
+            ValueError: If no FOVs have been configured via :meth:`add_fovs`.
         """
+        if not self.fovs:
+            raise ValueError("No FOVs configured. Call add_fovs() before run().")
+
         df_results = pd.DataFrame()
 
         initial_parameters, _ = self._select_initial_samples(k=4)
@@ -330,8 +336,8 @@ class BOptGPAX(InterPhaseAgent):
             self._wait_for_pipeline()
             tracks = {fov: self.read_tracks(fov) for fov in self.fovs}
             df_new_results = self._preprocess_results(tracks)
-            df_results = pd.concat([df_results, df_new_results], ignore_index=True)
             if not df_new_results.empty:
+                df_results = pd.concat([df_results, df_new_results], ignore_index=True)
                 self._iteration_means.append(
                     float(df_new_results[self.objective_metric.name].mean())
                 )
@@ -348,8 +354,8 @@ class BOptGPAX(InterPhaseAgent):
             self._wait_for_pipeline()
             tracks = {fov: self.read_tracks(fov) for fov in self.fovs}
             df_new_results = self._preprocess_results(tracks)
-            df_results = pd.concat([df_results, df_new_results], ignore_index=True)
             if not df_new_results.empty:
+                df_results = pd.concat([df_results, df_new_results], ignore_index=True)
                 self._iteration_means.append(
                     float(df_new_results[self.objective_metric.name].mean())
                 )
