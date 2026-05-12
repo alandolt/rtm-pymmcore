@@ -866,13 +866,22 @@ class Controller:
         return handle
 
     def continue_experiment(
-        self, events, *, stim_mode="current", validate=True
+        self, events, *, stim_mode="current", validate=True, offset_timepoints=True
     ) -> RunHandle:
         """Continue acquisition with new events, preserving Analyzer state.
 
         Same async semantics as :meth:`run_experiment`. Reuses the existing
         ``Analyzer`` and per-FOV state so tracking and timestep counters
         continue seamlessly across runs.
+
+        Args:
+            offset_timepoints: If True (default), event timestep indices
+                (``t``) are shifted so they continue after the previous
+                phase — correct when the **same** FOVs are reused across
+                phases.  Set to False when every phase uses **fresh** FOVs
+                (e.g. batch BO with per-phase FOV finder): the new FOVs
+                have never been seen before, so their timesteps should
+                start from 0.
 
         Raises:
             RuntimeError: If no previous experiment exists to continue, or
@@ -900,7 +909,22 @@ class Controller:
                     "Fix the issues or pass validate=False to skip."
                 )
 
-        offset_events = self._offset_events(events)
+        if offset_timepoints:
+            offset_events = self._offset_events(events)
+        else:
+            # Keep original t values; still stamp time_offset in metadata
+            offset_events = []
+            for ev in events:
+                offset_events.append(
+                    ev.model_copy(
+                        update={
+                            "metadata": {
+                                **ev.metadata,
+                                "time_offset": self._time_offset,
+                            },
+                        }
+                    )
+                )
         offset_events = sorted(
             offset_events,
             key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)),
@@ -1002,6 +1026,20 @@ class Controller:
 
             if self._writer is not None:
                 self._writer.save_events(self._all_events)
+                # Per-phase snapshot so a later phase overwriting the cumulative
+                # events.json doesn't lose earlier phases' provenance
+                # (composed-agent / batch-BO with fresh FOVs).
+                phase_id = events[0].metadata.get("phase_id") if events else None
+                if phase_id is not None:
+                    from faro.core.conversion import save_events_json
+
+                    events_dir = os.path.join(self._writer.storage_path, "events")
+                    os.makedirs(events_dir, exist_ok=True)
+                    save_events_json(events_dir, events)
+                    src = os.path.join(events_dir, "events.json")
+                    dst = os.path.join(events_dir, f"events_phase_{phase_id:03d}.json")
+                    if os.path.exists(src):
+                        os.replace(src, dst)
 
             if (
                 not is_continue
