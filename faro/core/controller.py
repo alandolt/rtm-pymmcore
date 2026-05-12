@@ -684,10 +684,18 @@ class Controller:
                 events_dir = os.path.join(self._writer.storage_path, "events")
                 os.makedirs(events_dir, exist_ok=True)
                 save_events_json(events_dir, events)
-                src = os.path.join(events_dir, "events.json")
-                dst = os.path.join(events_dir, f"events_phase_{phase_id:03d}.json")
-                if os.path.exists(src):
-                    os.replace(src, dst)
+                # save_events_json writes events.json.gz; rename to the
+                # phase-tagged copy.  The legacy uncompressed src is
+                # kept as a fallback for runs migrating across the
+                # compression switch.
+                for ext in (".json.gz", ".json"):
+                    src = os.path.join(events_dir, f"events{ext}")
+                    if os.path.exists(src):
+                        dst = os.path.join(
+                            events_dir, f"events_phase_{phase_id:03d}{ext}"
+                        )
+                        os.replace(src, dst)
+                        break
 
         # Initialize writer stream with values derived from events + microscope
         if (
@@ -801,11 +809,18 @@ class Controller:
                 events_dir = os.path.join(self._writer.storage_path, "events")
                 os.makedirs(events_dir, exist_ok=True)
                 save_events_json(events_dir, offset_events)
-                # Rename to phase-specific filename
-                src = os.path.join(events_dir, "events.json")
-                dst = os.path.join(events_dir, f"events_phase_{phase_id:03d}.json")
-                if os.path.exists(src):
-                    os.replace(src, dst)
+                # Rename to phase-specific filename.  save_events_json
+                # writes events.json.gz; check both the new (.gz) and
+                # legacy (.json) names so this remains compatible if
+                # save_events_json is ever toggled back.
+                for ext in (".json.gz", ".json"):
+                    src = os.path.join(events_dir, f"events{ext}")
+                    if os.path.exists(src):
+                        dst = os.path.join(
+                            events_dir, f"events_phase_{phase_id:03d}{ext}"
+                        )
+                        os.replace(src, dst)
+                        break
 
         self._validate_fov_positions(offset_events)
         self._run_mda_with_events(offset_events, stim_mode=stim_mode)
