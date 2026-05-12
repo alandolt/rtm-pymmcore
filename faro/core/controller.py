@@ -676,6 +676,18 @@ class Controller:
         self._all_events = list(events)
         if self._writer is not None:
             self._writer.save_events(self._all_events)
+            # Per-phase snapshot for phase 0
+            from faro.core.conversion import save_events_json
+
+            phase_id = events[0].metadata.get("phase_id") if events else None
+            if phase_id is not None:
+                events_dir = os.path.join(self._writer.storage_path, "events")
+                os.makedirs(events_dir, exist_ok=True)
+                save_events_json(events_dir, events)
+                src = os.path.join(events_dir, "events.json")
+                dst = os.path.join(events_dir, f"events_phase_{phase_id:03d}.json")
+                if os.path.exists(src):
+                    os.replace(src, dst)
 
         # Initialize writer stream with values derived from events + microscope
         if (
@@ -702,7 +714,14 @@ class Controller:
         # Update wall-clock offset for continuation
         self._time_offset = time.monotonic() - self._experiment_start
 
-    def continue_experiment(self, events, *, stim_mode="current", validate=True):
+    def continue_experiment(
+        self,
+        events,
+        *,
+        stim_mode="current",
+        validate=True,
+        offset_timepoints=True,
+    ):
         """Continue acquisition with new events, preserving all pipeline state.
 
         Reuses the existing ``Analyzer`` (and its ``FovState`` objects) so
@@ -712,9 +731,16 @@ class Controller:
 
         Args:
             events: Iterable of RTMEvent.  Timesteps and metadata will be
-                offset automatically.
+                offset automatically unless *offset_timepoints* is False.
             stim_mode: Same as :meth:`run_experiment`.
             validate: Same as :meth:`run_experiment`.
+            offset_timepoints: If True (default), event timestep indices
+                (``t``) are shifted so they continue after the previous
+                phase — correct when the **same** FOVs are reused across
+                phases.  Set to False when every phase uses **fresh** FOVs
+                (e.g. batch BO with per-phase FOV finder): the new FOVs
+                have never been seen before, so their timesteps should
+                start from 0.
 
         Raises:
             RuntimeError: If no previous experiment exists to continue.
@@ -739,7 +765,22 @@ class Controller:
                     "Fix the issues or pass validate=False to skip."
                 )
 
-        offset_events = self._offset_events(events)
+        if offset_timepoints:
+            offset_events = self._offset_events(events)
+        else:
+            # Keep original t values; still stamp time_offset in metadata
+            offset_events = []
+            for ev in events:
+                offset_events.append(
+                    ev.model_copy(
+                        update={
+                            "metadata": {
+                                **ev.metadata,
+                                "time_offset": self._time_offset,
+                            },
+                        }
+                    )
+                )
 
         # Pre-compute offset so extend_experiment can use it during the run
         if offset_events:
@@ -749,6 +790,22 @@ class Controller:
         self._all_events.extend(offset_events)
         if self._writer is not None:
             self._writer.save_events(self._all_events)
+            # Also save a per-phase snapshot so no phase's events are lost
+            # if the cumulative file is overwritten by a later phase.
+            from faro.core.conversion import save_events_json
+
+            phase_id = (
+                offset_events[0].metadata.get("phase_id") if offset_events else None
+            )
+            if phase_id is not None:
+                events_dir = os.path.join(self._writer.storage_path, "events")
+                os.makedirs(events_dir, exist_ok=True)
+                save_events_json(events_dir, offset_events)
+                # Rename to phase-specific filename
+                src = os.path.join(events_dir, "events.json")
+                dst = os.path.join(events_dir, f"events_phase_{phase_id:03d}.json")
+                if os.path.exists(src):
+                    os.replace(src, dst)
 
         self._validate_fov_positions(offset_events)
         self._run_mda_with_events(offset_events, stim_mode=stim_mode)
