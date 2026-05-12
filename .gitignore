@@ -1,6 +1,7 @@
 log.txt
 
 temp/
+uv.lock
 
 .vscode
 .vscode/*
