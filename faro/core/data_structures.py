@@ -676,25 +676,27 @@ class RTMSequence(MDASequence):
             sorted_stim_frames = sorted(stim_set)
             stim_exposure_map = dict(zip(sorted_stim_frames, self.stim_exposure))
 
+        def _rebuild_with_exposure(ch, exposure):
+            """Clone *ch* with a new exposure, preserving its concrete type
+            (Channel / PowerChannel / ...) and any extra fields like ``power``.
+            """
+            kwargs = {"config": ch.config, "exposure": exposure, "group": ch.group}
+            if isinstance(ch, PowerChannel):
+                kwargs["power"] = ch.power
+            return type(ch)(**kwargs)
+
         for (t, p), grp in groups.items():
             if stim_tuple and t in stim_set:
                 if self.stim_exposure is None:
                     stim = stim_tuple
                 elif isinstance(self.stim_exposure, (int, float)):
                     stim = tuple(
-                        Channel(
-                            config=ch.config,
-                            exposure=self.stim_exposure,
-                            group=ch.group,
-                        )
+                        _rebuild_with_exposure(ch, self.stim_exposure)
                         for ch in stim_tuple
                     )
                 else:
                     exp = stim_exposure_map[t]
-                    stim = tuple(
-                        Channel(config=ch.config, exposure=exp, group=ch.group)
-                        for ch in stim_tuple
-                    )
+                    stim = tuple(_rebuild_with_exposure(ch, exp) for ch in stim_tuple)
             else:
                 stim = ()
             ref = ref_tuple if ref_tuple and t in ref_set else ()
