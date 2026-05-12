@@ -150,11 +150,21 @@ class OscillationBO(BOptGPAX):
         max_baseline_cnr: float | None = 0.8,
         classifier_window: tuple[int, int] | None = None,
         frac_responder_threshold: float = 0.75,
+        max_stim_exposure_ms: float | None = None,
         save_checkpoints: bool = True,
         plot_live: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # Defensive ceiling on per-pulse stim exposure.  Pulses above this
+        # value are clipped (NOT dropped) and a loud warning is printed —
+        # clipping breaks the light_budget invariant for that condition.
+        # ``None`` (default) disables the cap.  Used by the fixed-budget
+        # notebook (v11) as a hardware/biology safeguard against
+        # multi-second pulses at extreme grid corners.
+        self.max_stim_exposure_ms = (
+            float(max_stim_exposure_ms) if max_stim_exposure_ms is not None else None
+        )
         self.n_frames = n_frames
         self.first_frame_stim = first_frame_stim
         self.last_frame_stim = last_frame_stim
@@ -304,6 +314,23 @@ class OscillationBO(BOptGPAX):
                     f"sub-{MIN_STIM_EXPOSURE_MS:g}ms pulses "
                     f"(min computed exposure was {min(all_exposures):.3f} ms)"
                 )
+
+            # Defensive max-exposure cap.  When self.max_stim_exposure_ms is
+            # set, clip any pulse above that threshold and warn loudly: the
+            # light_budget invariant is broken for the affected condition,
+            # because the cells receive less light than the BO requested.
+            if self.max_stim_exposure_ms is not None and kept:
+                over = [(f, e) for f, e in kept if e > self.max_stim_exposure_ms]
+                if over:
+                    pre_clip_peak = max(e for _, e in over)
+                    print(
+                        f"  Cond {cond_idx}: WARNING — clipping "
+                        f"{len(over)}/{len(kept)} pulses above "
+                        f"{self.max_stim_exposure_ms:g}ms cap "
+                        f"(peak pre-clip: {pre_clip_peak:.0f}ms). "
+                        f"light_budget invariant BROKEN for this condition."
+                    )
+                    kept = [(f, min(e, self.max_stim_exposure_ms)) for f, e in kept]
 
             if not kept:
                 print(
