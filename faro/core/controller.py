@@ -606,8 +606,9 @@ class Controller:
         self._t_offset: int = 0
         self._time_offset: float = 0.0
         self._experiment_start: float | None = None
-        self._event_queue: Queue | None = None  # for extend_experiment
+        self._event_queue: Queue | None = None  # for extend/replace_experiment
         self._pending_sentinels: int = 0  # number of None sentinels yet to consume
+        self._events_replaced = threading.Event()  # for replace_remaining_events
         self._fov_positions: dict[int, tuple[float, float, float]] = {}
         self._pre_loop_hook: callable | None = None  # testing hook
         self._all_events: list = []  # accumulated events for JSON persistence
