@@ -60,6 +60,7 @@ class Analyzer:
         max_queue_size: int = 60,
         *,
         writer: Writer | None = None,
+        agent=None,
         debug: bool = False,
         debug_every: int = 10,
         stim_mask_timeout: float = 80,
@@ -70,11 +71,14 @@ class Analyzer:
             max_workers: Number of worker threads for pipeline (default: 4)
             max_queue_size: Maximum images in executor queue before deferring (default: 60)
             writer: Storage backend. Defaults to TiffWriter if pipeline has storage_path.
+            agent: Optional Agent instance. Its on_frame_processed() is called
+                after each pipeline frame completes.
             stim_mask_timeout: Seconds to wait for a stim mask from the pipeline
                 before recording a background error and falling through with None.
                 Increase for slow first-frame segmenters (cellpose SAM, remote).
         """
         self.pipeline = pipeline
+        self._agent = agent
         if writer is not None:
             self.writer = writer
         elif pipeline is not None:
@@ -468,10 +472,16 @@ class Analyzer:
         with self.task_lock:
             self.active_pipeline_tasks -= 1
 
-        # Check if the task raised an exception
+        # Check if the task raised an exception and feed result to agent
         if future is not None:
             try:
-                future.result()  # This will re-raise any exception that occurred
+                result = future.result()
+                # Feed processed data to agent if present
+                if self._agent is not None and result is not None:
+                    try:
+                        self._agent.on_frame_processed(result)
+                    except Exception as e:
+                        print(f"[Analyzer] Agent error: {type(e).__name__}: {e}")
             except Exception as e:
                 self._record_background_error("pipeline", e)
 
@@ -570,17 +580,23 @@ class Controller:
 
     STOP_EVENT = object()
 
-    def __init__(self, mic, pipeline, *, writer: Writer | None = None):
+    def __init__(self, mic, pipeline, *, writer: Writer | None = None, agent=None):
         """
         Args:
             mic: AbstractMicroscope instance (hardware + config).
             pipeline: ImageProcessingPipeline instance.
             writer: Storage backend. If None, Analyzer uses TiffWriter (default).
                 Pass an OmeZarrWriter for OME-Zarr output.
+            agent: Optional Agent instance. Its ``on_frame_processed()`` is
+                called after each pipeline frame completes, and it can call
+                back into the controller (e.g. ``replace_remaining_events``).
         """
         self._mic = mic
         self._pipeline = pipeline
         self._writer = writer
+        self._agent = agent
+        if agent is not None:
+            agent.controller = self
         self._queue: Queue = Queue()
         self._analyzer: Analyzer | None = None
         self._n_channels: int = 1
@@ -675,7 +691,9 @@ class Controller:
                 n_stim_channels=_extract_n_stim_channels_from_events(events),
             )
 
-        self._analyzer = Analyzer(self._pipeline, writer=self._writer)
+        self._analyzer = Analyzer(
+            self._pipeline, writer=self._writer, agent=self._agent
+        )
         self._analyzer.stim_mode = stim_mode
         self._validate_fov_positions(events)
         self._run_mda_with_events(events, stim_mode=stim_mode)
@@ -761,6 +779,41 @@ class Controller:
         if offset_events:
             self._t_offset = max(e.index.get("t", 0) for e in offset_events) + 1
 
+    def replace_remaining_events(self, new_events):
+        """Clear all pending events and queue new ones. Thread-safe.
+
+        Use this when an agent detects an event and needs to immediately
+        switch to a different acquisition sequence (e.g., from slow scouting
+        to fast acquisition).
+
+        Raises:
+            RuntimeError: If no experiment is currently running.
+        """
+        if self._event_queue is None:
+            raise RuntimeError("No running experiment to replace events in.")
+
+        # Drain existing events and sentinels from queue
+        while True:
+            try:
+                self._event_queue.get_nowait()
+            except QueueEmpty:
+                break
+
+        self._pending_sentinels = 0
+
+        # Push new events with offset
+        new_events = list(new_events)
+        offset_events = self._offset_events(new_events)
+        for ev in offset_events:
+            self._event_queue.put(ev)
+        self._event_queue.put(None)  # terminal sentinel
+
+        if offset_events:
+            self._t_offset = max(e.index.get("t", 0) for e in offset_events) + 1
+
+        # Signal the event loop to continue (handles race with sentinel check)
+        self._events_replaced.set()
+
     def finish_experiment(self, *, drain_timeout: float = 300.0):
         """Shutdown the Analyzer and reset continuation state.
 
@@ -838,11 +891,12 @@ class Controller:
         """Run the MDA event loop — shared by run/continue_experiment."""
         self._mic.connect_frame(self._on_frame_ready)
 
-        # Set up event queue for extend_experiment support.
+        # Set up event queue for extend/replace_experiment support.
         # _pending_sentinels tracks how many extra batches (from
         # extend_experiment) still need to be drained.
         self._event_queue = Queue()
         self._pending_sentinels = 0
+        self._events_replaced = threading.Event()
         events = sorted(
             events, key=lambda e: (e.min_start_time or 0, e.index.get("p", 0))
         )
@@ -863,6 +917,10 @@ class Controller:
                     # Sentinel consumed — stop only if no extension pending
                     if self._pending_sentinels > 0:
                         self._pending_sentinels -= 1
+                        continue
+                    # Check if events were replaced before breaking
+                    if self._events_replaced.is_set():
+                        self._events_replaced.clear()
                         continue
                     break
 

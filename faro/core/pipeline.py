@@ -575,4 +575,8 @@ class ImageProcessingPipeline:
             writer=w,
         )
 
-        return {"result": "STOP"}
+        return {
+            "df_tracked": df_tracked,
+            "segmentation_results": segmentation_results,
+            "metadata": metadata,
+        }
