@@ -126,6 +126,16 @@ class ComposedAgent(InterPhaseAgent):
         # to the inner agent so its ``run_one_phase`` sees the controller.
         self.inner_agent.controller = value
 
+    def on_frame_processed(self, result: dict) -> None:
+        """Forward per-frame callbacks to the inner agent.
+
+        The Analyzer calls ``on_frame_processed`` on the top-level agent
+        registered with the Controller — which is this ComposedAgent.
+        Without forwarding, inner agents that rely on per-frame data
+        (e.g. :class:`ConditionMonitorAgent`) would never see it.
+        """
+        self.inner_agent.on_frame_processed(result)
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
