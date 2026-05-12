@@ -87,6 +87,15 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     def cancel_mda(self):
         self.mmc.mda.cancel()
 
+    def get_focus(self) -> float | None:
+        """Read the current focus device position (µm) via pymmcore-plus."""
+        if self.mmc is None:
+            return None
+        try:
+            return float(self.mmc.getPosition())
+        except Exception:
+            return None
+
     def resolve_group(self, config_name: str) -> str:
         """Return the channel group for *config_name*, auto-detecting if needed."""
         if self._current_group is None:

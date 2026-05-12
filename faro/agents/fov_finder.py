@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -110,7 +110,10 @@ class FOVFinderAgent(PreExperimentAgent):
         wells: Ordered list of well names (e.g. ``["B2", "B3", ...]``)
             consumed in chunks of ``wells_per_phase`` per call to
             :meth:`run`.
-        wells_per_phase: How many wells to consume per phase.
+        wells_per_phase: How many wells to consume per :meth:`run` call.
+            ``None`` (default) consumes the entire ``wells`` queue in
+            one phase — the right choice when you don't care about
+            multi-phase scheduling and just want all FOVs at once.
         fovs_per_well: How many valid FOV positions to return per well
             (after cell-count filtering and farthest-point selection).
         n_candidates_per_well: How many random candidate positions to scan
@@ -119,9 +122,24 @@ class FOVFinderAgent(PreExperimentAgent):
         border_um: Minimum distance (µm) to keep candidate positions away
             from the well edge.  Random candidates are generated inside a
             shape ``(well_size_x - 2*border_um, well_size_y - 2*border_um)``.
+        min_distance_um: Minimum centre-to-centre spacing (µm) between
+            random candidates within the same well.  Implemented by
+            passing ``fov_width = fov_height = min_distance_um`` and
+            ``allow_overlap=False`` to :class:`useq.RandomPoints`, which
+            then rejection-samples until non-overlapping FOV bounding
+            boxes can be placed.  Default ``1500`` µm — large enough to
+            give a visibly spread scan across a 96-well (6.4 mm) well
+            even when ``n_candidates_per_well`` is small.  Set to ``0``
+            to disable the constraint (overlap allowed, fastest), or
+            lower it for smaller wells / denser scans.
         min_cells: Minimum cell count for a candidate to be considered
             valid.  Positions with fewer cells are dropped before
             farthest-point sampling.
+        max_cells: Optional upper bound on cell count.  When set,
+            candidates with ``n_cells > max_cells`` are also marked
+            invalid (useful to skip overly confluent or
+            segmentation-artefact fields).  ``None`` (default) imposes
+            no upper limit.
         imaging_channels: Tuple of :class:`Channel` /
             :class:`PowerChannel` to acquire at each candidate position.
             Stim and reference channels are intentionally not used here.
@@ -133,14 +151,47 @@ class FOVFinderAgent(PreExperimentAgent):
             called per FOV and the resulting DataFrame is attached to the
             ``"all_candidates"`` output for downstream inspection.  This
             does not affect selection.
-        z: Optional fixed Z position for all candidates.  When ``None``
-            (default) the current focus reported by ``mmc.getPosition()``
-            is used at the moment :meth:`run` is invoked.
+        z: Z handling for the candidate positions.  Three modes:
+
+            * ``None`` (default) — the agent does **not** drive focus.
+              Candidate :class:`FovPosition`\\ s carry ``z=None``, so the
+              resulting useq ``MDAEvent``\\ s have ``z_pos=None`` and the
+              microscope engine leaves the Z stage untouched.  This is
+              the right mode whenever focus is held by the user
+              (pre-focused before starting) or by hardware autofocus /
+              PFS — e.g. on the Jungfrau microscope where
+              ``USE_ONLY_PFS = True``.
+            * ``"current"`` — snapshot the current focus once at the
+              start of each phase via
+              :meth:`AbstractMicroscope.get_focus` and pin every
+              candidate in that phase to it.  Use this on stages without
+              PFS when you want explicit, repeatable Z values written
+              into the events without manually typing one in.
+            * ``float`` — pin every candidate to this absolute Z (µm).
+              The agent will then actively command the Z stage to this
+              value via the standard useq event path.
         random_seed: Optional RNG seed.  Each phase derives a deterministic
             sub-seed from this so candidate generation and farthest-point
             tie-breaking are reproducible across runs.
         name_prefix: Prefix used to name returned :class:`FovPosition`
             tuples (``"<prefix>_<phase>_<wellname>_<i>"``).
+        return_json: Controls the return type of :meth:`run`.
+
+            * ``None`` (default) — return the canonical
+              ``list[FovPosition]`` (plain namedtuples; matches what
+              :func:`faro.core.utils.generate_fov_positions` produces).
+            * ``True`` — return ``list[useq.Position]`` instead.  These
+              are pydantic models with the full useq schema (``x``, ``y``,
+              ``z``, ``name``, ``sequence``, ``properties``,
+              ``plate_row``, ``plate_col``, ``grid_row``, ``grid_col``)
+              and serialise directly to the JSON shape that ``useq``-aware
+              tools (e.g. the pymmcore-widgets MDA position list) expect.
+        verbose: If ``True``, every :meth:`run` call shows debug plots
+            via matplotlib: one ``raw | segmentation`` figure per scanned
+            candidate (title carries the position name and detected cell
+            count) and a final per-well scatter showing the candidates
+            colour-coded by cell count with the FPS-selected positions
+            highlighted.  Off by default.
     """
 
     def __init__(
@@ -149,19 +200,23 @@ class FOVFinderAgent(PreExperimentAgent):
         *,
         well_plate_plan: str | Path | "WellPlatePlan",
         wells: list[str],
-        wells_per_phase: int,
+        wells_per_phase: int | None = None,
         fovs_per_well: int,
         n_candidates_per_well: int,
         border_um: float,
+        min_distance_um: float = 1500.0,
         min_cells: int,
+        max_cells: int | None = None,
         imaging_channels: tuple[Channel, ...],
         segmentator: Segmentator,
         seg_channel_index: int = 0,
         feature_extractor: FeatureExtractor | None = None,
-        z: float | None = None,
+        z: float | None | Literal["current"] = None,
         random_seed: int | None = None,
         name_prefix: str = "fov",
         strict_count: bool = True,
+        return_json: bool | None = None,
+        verbose: bool = False,
     ):
         """See class docstring.
 
@@ -178,8 +233,15 @@ class FOVFinderAgent(PreExperimentAgent):
                 to handle that.
         """
         super().__init__(microscope)
+        # Resolve wells_per_phase: None -> consume the entire queue.
+        if wells_per_phase is None:
+            wells_per_phase = len(wells)
         if wells_per_phase <= 0:
             raise ValueError("wells_per_phase must be positive")
+        if max_cells is not None and max_cells < min_cells:
+            raise ValueError(
+                f"max_cells ({max_cells}) must be >= min_cells ({min_cells})"
+            )
         if fovs_per_well <= 0:
             raise ValueError("fovs_per_well must be positive")
         if n_candidates_per_well < fovs_per_well:
@@ -189,15 +251,21 @@ class FOVFinderAgent(PreExperimentAgent):
             )
         if border_um < 0:
             raise ValueError("border_um must be non-negative")
+        if min_distance_um < 0:
+            raise ValueError("min_distance_um must be non-negative")
         if not imaging_channels:
             raise ValueError("imaging_channels must contain at least one channel")
+        if not (z is None or z == "current" or isinstance(z, (int, float))):
+            raise ValueError(f"z must be None, 'current', or a float; got {z!r}")
 
         self.well_plate_plan_input = well_plate_plan
         self.wells_per_phase = int(wells_per_phase)
         self.fovs_per_well = int(fovs_per_well)
         self.n_candidates_per_well = int(n_candidates_per_well)
         self.border_um = float(border_um)
+        self.min_distance_um = float(min_distance_um)
         self.min_cells = int(min_cells)
+        self.max_cells = None if max_cells is None else int(max_cells)
         self.imaging_channels = tuple(imaging_channels)
         self.segmentator = segmentator
         self.seg_channel_index = int(seg_channel_index)
@@ -206,6 +274,8 @@ class FOVFinderAgent(PreExperimentAgent):
         self.random_seed = random_seed
         self.name_prefix = name_prefix
         self.strict_count = bool(strict_count)
+        self.return_json = bool(return_json) if return_json is not None else False
+        self.verbose = bool(verbose)
 
         self._plan = self._load_plan(well_plate_plan)
         self._plate: WellPlate = self._plan.plate
@@ -272,14 +342,23 @@ class FOVFinderAgent(PreExperimentAgent):
         well_size_y_um = float(self._plate.well_size[1]) * 1000.0
         max_w = max(well_size_x_um - 2.0 * self.border_um, 1.0)
         max_h = max(well_size_y_um - 2.0 * self.border_um, 1.0)
-        rp = RandomPoints(
+        # If the user requested a minimum spacing, use useq's non-overlap
+        # rejection sampler with FOV-size = min_distance.  Otherwise let
+        # candidates fall freely (faster, but may bunch up).
+        rp_kwargs: dict[str, Any] = dict(
             num_points=n_points,
             max_width=max_w,
             max_height=max_h,
             shape=Shape.ELLIPSE if self._plate.circular_wells else Shape.RECTANGLE,
             random_seed=seed,
-            allow_overlap=True,
         )
+        if self.min_distance_um > 0:
+            rp_kwargs["fov_width"] = self.min_distance_um
+            rp_kwargs["fov_height"] = self.min_distance_um
+            rp_kwargs["allow_overlap"] = False
+        else:
+            rp_kwargs["allow_overlap"] = True
+        rp = RandomPoints(**rp_kwargs)
         return np.array([(p.x, p.y) for p in rp], dtype=float)
 
     # ------------------------------------------------------------------
@@ -402,6 +481,19 @@ class FOVFinderAgent(PreExperimentAgent):
             label_max = int(label_img.max()) if label_img.size > 0 else 0
             n_cells = label_max if label_max > 0 else 0
 
+            if self.verbose:
+                self._debug_show_candidate(fp, seg_input, label_img, n_cells)
+
+            below = n_cells < self.min_cells
+            above = self.max_cells is not None and n_cells > self.max_cells
+            valid = not (below or above)
+            if below:
+                reason = "below_min_cells"
+            elif above:
+                reason = "above_max_cells"
+            else:
+                reason = ""
+
             row: dict[str, Any] = {
                 "p": p_idx,
                 "x": fp.x,
@@ -410,8 +502,8 @@ class FOVFinderAgent(PreExperimentAgent):
                 # "well" is overwritten in run() from the parallel
                 # candidate_well list (the source of truth).
                 "n_cells": n_cells,
-                "valid": n_cells >= self.min_cells,
-                "reason": "" if n_cells >= self.min_cells else "below_min_cells",
+                "valid": valid,
+                "reason": reason,
             }
 
             if self.feature_extractor is not None:
@@ -441,35 +533,44 @@ class FOVFinderAgent(PreExperimentAgent):
     # Main entry point
     # ------------------------------------------------------------------
 
-    def run(self) -> dict[str, Any]:
+    def run(self) -> list[FovPosition] | list[Any]:
         """Find FOV positions for one phase.
 
         Returns:
-            Dict with keys:
+            By default a ``list[FovPosition]`` with the FPS-selected
+            positions (length ``wells_per_phase * fovs_per_well`` when
+            all wells yielded enough valid candidates).  Each position
+            name is ``"<well>_<i:04d>"`` (e.g. ``"B3_0000"``) and ``z``
+            is left as ``None`` when the agent is not driving focus
+            (PFS-friendly default).
 
-            * ``"positions"`` – list of selected :class:`FovPosition`
-              tuples (length ``wells_per_phase * fovs_per_well`` when all
-              wells yielded enough valid candidates).
-            * ``"wells_used"`` – list of well names consumed this phase.
-            * ``"all_candidates"`` – DataFrame of every scanned candidate
-              with cell counts (and optional feature-extractor outputs).
-            * ``"phase"`` – zero-based phase index for this call.
+            If the agent was constructed with ``return_json=True`` the
+            same positions are returned as ``list[useq.Position]``
+            instead, which serialise directly to the JSON shape that
+            ``useq``-aware tools expect.
+
+            Per-phase debug data — wells consumed, the full
+            ``all_candidates`` DataFrame, and the parallel
+            ``wells_for_positions`` list — is stashed on
+            :attr:`last_run` after every call (overwritten each phase).
         """
         wells = self.pick_next_wells()
         phase = self._phase_index
-        print(
-            f"[FOVFinderAgent] Phase {phase}: scanning "
-            f"{self.n_candidates_per_well} candidates in "
-            f"{len(wells)} wells: {wells}"
-        )
+        if self.verbose:
+            print(
+                f"[FOVFinderAgent] Phase {phase}: scanning "
+                f"{self.n_candidates_per_well} candidates in "
+                f"{len(wells)} wells: {wells}"
+            )
 
-        # Resolve a Z value for all candidates if the user did not pin one.
-        z_value = self.z
-        if z_value is None:
-            try:
-                z_value = float(self.microscope.mmc.getPosition())
-            except Exception:
-                z_value = None
+        # Resolve the Z value to write into this phase's candidate events.
+        #   - None     -> leave Z untouched (PFS / pre-focused; no z_pos)
+        #   - "current"-> snapshot focus once via the mic-agnostic accessor
+        #   - float    -> pin every candidate to this absolute Z
+        if self.z == "current":
+            z_value = self.microscope.get_focus()
+        else:
+            z_value = self.z
 
         # 1. Generate candidates for every well.
         all_candidates: list[FovPosition] = []
@@ -508,10 +609,11 @@ class FOVFinderAgent(PreExperimentAgent):
 
             n_valid = len(df_valid)
             if n_valid == 0 and not self.strict_count:
-                print(
-                    f"[FOVFinderAgent] WARNING: well {well} has no valid "
-                    f"positions (need >= {self.min_cells} cells); skipping."
-                )
+                if self.verbose:
+                    print(
+                        f"[FOVFinderAgent] WARNING: well {well} has no valid "
+                        f"positions (need >= {self.min_cells} cells); skipping."
+                    )
                 continue
 
             if n_valid > 0:
@@ -540,27 +642,28 @@ class FOVFinderAgent(PreExperimentAgent):
                 df_pad = df_unused.nlargest(needed, "n_cells")
                 if len(df_pad) > 0:
                     df_picked = pd.concat([df_picked, df_pad], ignore_index=False)
-                    print(
-                        f"[FOVFinderAgent] WARNING: well {well} only had "
-                        f"{n_picked}/{self.fovs_per_well} valid positions; "
-                        f"padded with {len(df_pad)} below-threshold "
-                        f"candidates (best n_cells={int(df_pad['n_cells'].max())})."
-                    )
-                else:
+                    if self.verbose:
+                        print(
+                            f"[FOVFinderAgent] WARNING: well {well} only had "
+                            f"{n_picked}/{self.fovs_per_well} valid positions; "
+                            f"padded with {len(df_pad)} below-threshold "
+                            f"candidates (best n_cells={int(df_pad['n_cells'].max())})."
+                        )
+                elif self.verbose:
                     print(
                         f"[FOVFinderAgent] WARNING: well {well} has no "
                         f"candidates at all to pad with; phase will have "
                         f"fewer FOVs than expected."
                     )
 
-            if not self.strict_count and n_picked < self.fovs_per_well:
+            if not self.strict_count and n_picked < self.fovs_per_well and self.verbose:
                 print(
                     f"[FOVFinderAgent] WARNING: well {well} only yielded "
                     f"{n_picked}/{self.fovs_per_well} valid positions."
                 )
 
             for k, (_, row) in enumerate(df_picked.iterrows()):
-                name = f"{self.name_prefix}_p{phase}_{well}_{k}"
+                name = f"{well}_{k:04d}"
                 selected.append(
                     FovPosition(
                         x=float(row["x"]),
@@ -571,7 +674,15 @@ class FOVFinderAgent(PreExperimentAgent):
                 )
                 wells_for_positions.append(well)
 
-        result: dict[str, Any] = {
+        if self.verbose:
+            self._debug_show_well_summary(
+                wells, df_scan, selected, wells_for_positions, phase
+            )
+
+        # Stash phase-level debug data so notebooks / inspectors can
+        # still reach the wells, the candidate dataframe, etc. without
+        # cluttering the public return value.
+        self.last_run: dict[str, Any] = {
             "positions": selected,
             "wells_for_positions": wells_for_positions,
             "wells_used": list(wells),
@@ -587,10 +698,89 @@ class FOVFinderAgent(PreExperimentAgent):
             }
         )
         self._phase_index += 1
-        print(
-            f"[FOVFinderAgent] Phase {phase}: selected "
-            f"{len(selected)} FOVs across {len(wells)} wells "
-            f"(median valid candidates/well: "
-            f"{int(df_scan.groupby('well')['valid'].sum().median()) if not df_scan.empty else 0})."
+        if self.verbose:
+            print(
+                f"[FOVFinderAgent] Phase {phase}: selected "
+                f"{len(selected)} FOVs across {len(wells)} wells "
+                f"(median valid candidates/well: "
+                f"{int(df_scan.groupby('well')['valid'].sum().median()) if not df_scan.empty else 0})."
+            )
+
+        if self.return_json:
+            from useq import Position
+
+            return [Position(x=fp.x, y=fp.y, z=fp.z, name=fp.name) for fp in selected]
+        return selected
+
+    # ------------------------------------------------------------------
+    # Debug plotting (verbose=True)
+    # ------------------------------------------------------------------
+
+    def _debug_show_candidate(
+        self,
+        fp: FovPosition,
+        seg_input: np.ndarray,
+        label_img: np.ndarray,
+        n_cells: int,
+    ) -> None:
+        """Show ``raw | segmentation`` for a single scanned candidate."""
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+        axes[0].imshow(seg_input, cmap="gray")
+        axes[0].set_title(f"{fp.name}\nx={fp.x:.0f}  y={fp.y:.0f}")
+        axes[0].axis("off")
+        axes[1].imshow(label_img, cmap="nipy_spectral")
+        axes[1].set_title(f"segmentation — {n_cells} cells")
+        axes[1].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    def _debug_show_well_summary(
+        self,
+        wells: list[str],
+        df_scan: pd.DataFrame,
+        selected: list[FovPosition],
+        wells_for_positions: list[str],
+        phase: int,
+    ) -> None:
+        """Per-well scatter of candidates with FPS-selected points highlighted."""
+        import matplotlib.pyplot as plt
+
+        selected_by_well: dict[str, list[FovPosition]] = {}
+        for fp, w in zip(selected, wells_for_positions):
+            selected_by_well.setdefault(w, []).append(fp)
+
+        fig, axes = plt.subplots(
+            1, len(wells), figsize=(4 * len(wells), 4), squeeze=False
         )
-        return result
+        for ax, well in zip(axes[0], wells):
+            df_w = df_scan[df_scan["well"] == well]
+            sc = ax.scatter(
+                df_w["x"],
+                df_w["y"],
+                c=df_w["n_cells"],
+                cmap="viridis",
+                s=80,
+                edgecolors="k",
+                linewidths=0.5,
+            )
+            sel = selected_by_well.get(well, [])
+            if sel:
+                ax.scatter(
+                    [fp.x for fp in sel],
+                    [fp.y for fp in sel],
+                    marker="x",
+                    c="red",
+                    s=200,
+                    linewidths=3,
+                    label="selected",
+                )
+                ax.legend(loc="best")
+            ax.set_title(f"phase {phase} — well {well}")
+            ax.set_xlabel("x (µm)")
+            ax.set_ylabel("y (µm)")
+            ax.set_aspect("equal")
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="n_cells")
+        plt.tight_layout()
+        plt.show()
