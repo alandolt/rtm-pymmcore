@@ -437,6 +437,8 @@ class DoseResponseBO(BOptGPAX):
         import gpax.utils
         import jax.numpy as jnp
 
+        gpax.utils.enable_x64()
+
         cache = getattr(self, "_cached_gp_fit", None)
         is_first_call_in_batch = cache is None
 

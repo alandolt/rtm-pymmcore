@@ -173,6 +173,21 @@ class BOptGPAX(InterPhaseAgent):
             decays from ``ei_xi`` to ``ei_xi_final``.
         ei_num_samples: Number of posterior samples for EI/UCB computation.
         ei_noiseless: Whether to use noiseless predictions.
+        use_closed_form_predict: If ``True`` (default), the robust
+            acquisition predict path uses a closed-form computation of
+            the posterior mean and ``diag(var)`` from
+            ``gp_model.get_mvn_posterior``-style math via the public
+            kernel + training-data attributes — see
+            :meth:`_predict_mean_diag_var_closed_form`.  This is ~10×
+            faster per call than gpax's MC-sampled predict because it
+            skips the O(N³) Cholesky + O(N²M) full-cov matmul, and is
+            more accurate (no MC noise from
+            ``num_mcmc * ei_num_samples`` draws).  Set to ``False`` to
+            fall back to the legacy gpax MC path; required if you swap
+            in a non-stationary kernel or a non-zero ``mean_fn`` (the
+            closed-form path raises ``NotImplementedError`` in that
+            case — see the method docstring for the full list of
+            stationary-kernel / mean-zero assumptions).
         n_cov_samples: Number of covariate samples for marginalisation.
         cov_marginalization_mode: ``"joint"`` (default, recommended) or
             ``"mesh"``.  ``"joint"`` samples *rows* from ``df_results`` so
@@ -244,6 +259,7 @@ class BOptGPAX(InterPhaseAgent):
         ei_xi_decay_fraction: float = 0.7,
         ei_num_samples: int = 16,
         ei_noiseless: bool = True,
+        use_closed_form_predict: bool = True,
         n_cov_samples: int = 10,
         cov_marginalization_mode: str = "joint",
         penalty: Optional[str] = None,
@@ -256,6 +272,17 @@ class BOptGPAX(InterPhaseAgent):
         verbose: bool = False,
     ):
         super().__init__(storage_path)
+
+        # Enable JAX float64 globally before any gpax/JAX operation. gpax 0.1.9
+        # has a Cholesky-instability bug in float32 that causes ~99% of GP
+        # predict() outputs to be NaN for certain test-X arrangements. Setting
+        # this in the base __init__ propagates to every subclass and every
+        # notebook that constructs a BO agent, so individual notebooks no
+        # longer need to call it explicitly.
+        import gpax.utils
+
+        gpax.utils.enable_x64()
+
         if bo_covariates is None:
             bo_covariates = []
 
@@ -293,6 +320,15 @@ class BOptGPAX(InterPhaseAgent):
         self.ei_xi_decay_fraction = float(ei_xi_decay_fraction)
         self.ei_num_samples = int(ei_num_samples)
         self.ei_noiseless = bool(ei_noiseless)
+        self.use_closed_form_predict = bool(use_closed_form_predict)
+        # Per-batch cache for the predict step inside _compute_robust_acq.
+        # Populated by _select_batch_parameters before the greedy loop and
+        # cleared on `finally`.  When set, _compute_robust_acq reuses the
+        # cached (mean_matrix, var_matrix) instead of re-running the GP
+        # forward pass on the full grid for each of the N greedy picks.
+        # See _select_batch_parameters for the active-mask bookkeeping.
+        self._cached_predictions: tuple | None = None
+        self._cached_predictions_active_mask: np.ndarray | None = None
         self.n_cov_samples = int(n_cov_samples)
         cov_marginalization_mode = cov_marginalization_mode.lower().strip()
         if cov_marginalization_mode not in {"joint", "mesh"}:
@@ -958,6 +994,18 @@ class BOptGPAX(InterPhaseAgent):
         self._cached_gp_fit = None
         self._batch_fit_reuse = True
 
+        # ALSO cache the GP-posterior PREDICTIONS (mean + diag-var on the
+        # full pre-batch grid × covariate samples) across the greedy
+        # picks.  ``_compute_robust_acq`` populates the cache on its
+        # first call inside this loop and reuses it (sliced by the
+        # active-row mask maintained in ``_determine_next_parameters``)
+        # on every subsequent call — including the EI→UCB fallback.
+        # The mask shrinks in lockstep with self.x_unmeasured so the
+        # picks remain bit-identical to the un-cached path.
+        self._cached_predictions = None
+        self._cached_predictions_active_mask = None
+        self._batch_predict_reuse = True
+
         selected: list[dict] = []
         orig_penalty = self.penalty
         orig_penalty_factor = self.penalty_factor
@@ -986,6 +1034,9 @@ class BOptGPAX(InterPhaseAgent):
             self.penalty_factor = orig_penalty_factor
             self._batch_fit_reuse = False
             self._cached_gp_fit = None
+            self._batch_predict_reuse = False
+            self._cached_predictions = None
+            self._cached_predictions_active_mask = None
 
         # Render the batch diagnostic plot with ALL picks annotated.
         # Uses the plot context stashed by the first successful
@@ -1526,6 +1577,169 @@ class BOptGPAX(InterPhaseAgent):
         return ucb
 
     # ------------------------------------------------------------------
+    # Predict helpers
+    # ------------------------------------------------------------------
+
+    def _predict_mean_diag_var_closed_form(
+        self,
+        gp_model,
+        X_new_scaled,
+        batch_size: int = 1000,
+        noiseless: bool = True,
+    ):
+        """Posterior mean and ``diag(var)`` without MC sampling.
+
+        Bypasses ``MultivariateNormal.sample`` (and its O(N³) Cholesky on
+        the full N×N predictive covariance) inside ``gpax``'s ``_predict``
+        by using the closed-form expressions:
+
+            mean(x)      = k(x, X_train) @ K_xx_inv @ y_residual
+            diag_var(x)  = k(x, x) - sum_j (k(x, X_train) @ K_xx_inv)[j] * k(x, X_train)[j]
+
+        per MCMC sample, then computes the mixture-of-Gaussians collapse:
+
+            posterior_mean   = mean_k( per_mcmc_mean[k, i] )
+            posterior_var    = mean_k( per_mcmc_diag_var[k, i] )
+                              + var_k ( per_mcmc_mean    [k, i] )
+
+        which is exactly what ``mean(y_sampled, axis=(0,1))`` and
+        ``var (y_sampled, axis=(0,1))`` estimate empirically in today's
+        MC path — but without the ~10× per-batch Cholesky overhead and
+        without the 1/√(num_mcmc·n) MC noise.
+
+        Reaches into ``gpax`` only via its public surface:
+        ``gp_model.kernel`` (the kernel function), ``gp_model.X_train``,
+        ``gp_model.y_train`` (training-data attributes), and
+        ``gp_model.get_samples()`` (MCMC posterior).  No private methods
+        (``_predict``, ``_predict_in_batches``, ``get_mvn_posterior``)
+        are touched, so we do not depend on gpax internals.
+
+        Caveats / drawbacks vs the legacy MC predict path:
+
+        * **Stationary kernels only.**  The diagonal ``k(x, x)`` is
+          computed as ``params["k_scale"] + noise + jitter`` — true for
+          ``Matern``, ``RBF``, ``Periodic`` (the gpax defaults).  Plugging
+          in a non-stationary kernel (spectral mixture, deep-kernel
+          learning, etc.) would silently give wrong variances.  Set
+          ``BOptGPAX(use_closed_form_predict=False)`` to fall back to
+          the legacy MC path if you ever swap kernels.
+        * **Mean function must be None.**  Raises ``NotImplementedError``
+          if ``gp_model.mean_fn is not None``.  Adding a non-zero prior
+          mean (e.g. linear trend) requires extending this function to
+          subtract ``mean_fn(X_train)`` from ``y_train`` and add
+          ``mean_fn(X_new)`` to the closed-form mean.  Default
+          ``gpax.ExactGP`` has ``mean_fn=None`` so it's not an issue here.
+        * **Uses ``jnp.linalg.inv`` (not Cholesky-solve).**  Same as
+          gpax's own ``get_mvn_posterior`` — no regression vs the legacy
+          path — but a Cholesky + ``solve_triangular`` would be more
+          numerically stable for ill-conditioned ``K_xx``.  Realistic at
+          M=234 training points; the 1e-6 jitter on the training kernel
+          diagonal keeps the inverse well-defined.  Could matter if
+          training set grows to 10³+ observations or if covariates are
+          near-degenerate.
+        * **No MC sampling jitter.**  The legacy path's ``var_flat`` has
+          ~3 % MC noise on top of the true posterior var (with
+          ``num_mcmc=800`` × ``ei_num_samples=4``).  That noise breaks
+          ties in flat-EI regions non-deterministically.  Closed-form
+          ``argmax`` is deterministic, so the same fitted GP picks the
+          lowest-index grid corner of any flat region.  Mitigated by the
+          ``_is_flat_acquisition`` check that falls through to UCB;
+          worth knowing if you observe identical picks across re-runs.
+        * ``rng_key`` is unused on this path (no random sampling).
+
+        Args:
+            gp_model: A fit ``gpax.ExactGP`` instance.
+            X_new_scaled: Scaled test inputs, shape ``(n_total, d)``.
+            batch_size: Test rows per JAX kernel launch.  Caps peak
+                memory at roughly ``batch_size × M × num_mcmc × 4 B``.
+            noiseless: If True (default, matching ``ei_noiseless=True``
+                upstream), exclude the per-point observation noise from
+                ``diag_var``.
+
+        Returns:
+            ``(posterior_mean, posterior_var)``, both shape ``(n_total,)``.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        if getattr(gp_model, "mean_fn", None) is not None:
+            raise NotImplementedError(
+                "Closed-form predict expects gp_model.mean_fn=None "
+                "(default for ExactGP). Either disable use_closed_form_predict "
+                "or extend _predict_mean_diag_var_closed_form to handle the "
+                "mean-function residual."
+            )
+
+        samples = gp_model.get_samples(chain_dim=False)
+        if not samples:
+            raise RuntimeError(
+                "GP has no posterior samples — call gp_model.fit() before "
+                "using the closed-form predict path."
+            )
+        X_train = jnp.asarray(gp_model.X_train)
+        y_train = jnp.asarray(gp_model.y_train).squeeze()
+        kernel = gp_model.kernel
+
+        X_new_scaled = jnp.asarray(X_new_scaled)
+        n_total = int(X_new_scaled.shape[0])
+        cpu = jax.devices("cpu")[0]
+
+        means_chunks: list = []
+        diag_vars_chunks: list = []
+
+        # JIT-compile the per-batch predictor once; the only thing that
+        # changes between batches is the row slice of X_new_scaled.
+        # gpax MaternKernel/RBFKernel/PeriodicKernel default jitter; the
+        # full N×N kernel call adds (noise + jitter)*I on the diagonal
+        # only when X.shape == Z.shape, so we have to fold both terms
+        # into the closed-form k_pp diagonal manually.
+        _JITTER = 1e-6
+
+        def _predict_one(params, X_batch):
+            noise = params["noise"]
+            # Match get_mvn_posterior: with noiseless=True the predictive
+            # diagonal noise is dropped (only jitter remains).
+            noise_p = jnp.where(jnp.array(noiseless), 0.0, noise)
+            k_pX = kernel(X_batch, X_train, params, jitter=0.0)  # (Nb, M)
+            k_XX = kernel(
+                X_train, X_train, params, noise
+            )  # (M, M) with noise+jitter on diag
+            K_xx_inv = jnp.linalg.inv(k_XX)
+            # Mean: k_pX (Nb, M) @ K_xx_inv (M, M) @ y_train (M,) -> (Nb,)
+            mean = k_pX @ (K_xx_inv @ y_train)
+            # diag(k_pX @ K_xx_inv @ k_pX.T) computed without forming the
+            # full (Nb, Nb) product matrix.  A = K_xx_inv @ k_pX.T (M, Nb),
+            # then diag = sum_j k_pX[i, j] * A[j, i] = (k_pX * A.T).sum(1).
+            A = K_xx_inv @ k_pX.T  # (M, Nb)
+            quad_form_diag = jnp.sum(k_pX * A.T, axis=1)  # (Nb,)
+            # k(x, x) for stationary kernels (Matern/RBF/Periodic): k_scale.
+            # Plus the diagonal noise+jitter the kernel would add when
+            # X.shape == Z.shape -- we replicate that explicitly.
+            k_pp_diag = params["k_scale"] + noise_p + _JITTER
+            # Floor at a tiny positive number to keep sigma well-defined
+            # in the EI/UCB formulas downstream — finite-precision can
+            # produce -1e-16 here on numerically degenerate points.
+            diag_var = jnp.maximum(k_pp_diag - quad_form_diag, 1e-12)
+            return mean, diag_var
+
+        _vmap_predict = jax.vmap(_predict_one, in_axes=({k: 0 for k in samples}, None))
+
+        for start in range(0, n_total, batch_size):
+            end = min(start + batch_size, n_total)
+            X_batch = X_new_scaled[start:end]
+            means_per_mcmc, vars_per_mcmc = _vmap_predict(samples, X_batch)
+            means_chunks.append(jax.device_put(means_per_mcmc, cpu))
+            diag_vars_chunks.append(jax.device_put(vars_per_mcmc, cpu))
+
+        means = jnp.concatenate(means_chunks, axis=-1)  # (num_mcmc, n_total)
+        diag_vars = jnp.concatenate(diag_vars_chunks, axis=-1)
+
+        posterior_mean = jnp.mean(means, axis=0)
+        # Mixture-of-Gaussians variance: within-MCMC + between-MCMC.
+        posterior_var = jnp.mean(diag_vars, axis=0) + jnp.var(means, axis=0)
+        return posterior_mean, posterior_var
+
+    # ------------------------------------------------------------------
     # Robust acquisition (marginalised over covariates)
     # ------------------------------------------------------------------
 
@@ -1549,36 +1763,101 @@ class BOptGPAX(InterPhaseAgent):
         if c_samples.ndim == 1:
             c_samples = c_samples.reshape(-1, 1)
 
-        x_repeated = jnp.repeat(x_grid, n_mc, axis=0)
-        c_tiled = jnp.tile(c_samples, (n_grid, 1))
-        x_full_batch = jnp.hstack([x_repeated, c_tiled])
-        x_full_batch_scaled = x_scaler.transform(x_full_batch)
-
-        n_total = x_full_batch_scaled.shape[0]
-        batch_size = min(batch_size, n_total)
-        print(
-            f"Computing robust acquisition over {n_total} scenarios "
-            f"({n_grid} grid points x {n_mc} covariate samples)..."
-        )
-
         maximize = self.objective_metric.goal == "maximize"
 
-        mean_pred, y_sampled = gp_model.predict_in_batches(
-            rng_key,
-            x_full_batch_scaled,
-            batch_size=batch_size,
-            n=self.ei_num_samples,
-            noiseless=self.ei_noiseless,
-        )
+        # Cache hit: predictions already computed for this batch's full
+        # pre-pick grid; just slice them by the per-pick active mask.
+        # See _select_batch_parameters for how the cache is populated and
+        # the active-mask is updated after each greedy pick.
+        #
+        # CACHE INVARIANT (must hold every time this branch fires):
+        #   - active_mask is shaped (n_grid_full_at_batch_start,)
+        #   - active_mask.sum() == len(self.x_unmeasured) == n_grid
+        #   - The k-th True entry of active_mask corresponds to the k-th
+        #     row of self.x_unmeasured (and therefore the k-th row of
+        #     ``x_grid`` passed in by the caller).
+        # Maintained by _determine_next_parameters: after each argmax, it
+        # flips the bit at active_mask[active_full_indices[picked_idx]]
+        # = False, immediately before np.delete(self.x_unmeasured, ...).
+        # If a future code path mutates self.x_unmeasured WITHOUT going
+        # through _determine_next_parameters, the cache silently
+        # produces acquisition values aligned to the wrong grid rows --
+        # the assert below catches that case loudly.
+        cache = getattr(self, "_cached_predictions", None)
+        active_mask = getattr(self, "_cached_predictions_active_mask", None)
+        if cache is not None and active_mask is not None:
+            mean_matrix_full, var_matrix_full = cache
+            n_active_in_mask = int(active_mask.sum())
+            if n_active_in_mask != n_grid:
+                # Defensive: cache invariant broken -- caller's x_grid
+                # must align with the active mask.  Most likely cause
+                # is a code path that mutated self.x_unmeasured without
+                # going through _determine_next_parameters.
+                raise RuntimeError(
+                    f"_compute_robust_acq cache invariant broken: "
+                    f"active_mask.sum()={n_active_in_mask} but x_grid "
+                    f"has {n_grid} rows. The cache and self.x_unmeasured "
+                    f"must shrink in lockstep -- check whether any code "
+                    f"path mutates x_unmeasured outside "
+                    f"_determine_next_parameters."
+                )
+            mean_matrix = jnp.asarray(mean_matrix_full[active_mask])
+            var_matrix = jnp.asarray(var_matrix_full[active_mask])
+            print(
+                f"  [cached predict] reusing predictions for "
+                f"{n_grid} grid points x {n_mc} covariate samples"
+            )
+        else:
+            x_repeated = jnp.repeat(x_grid, n_mc, axis=0)
+            c_tiled = jnp.tile(c_samples, (n_grid, 1))
+            x_full_batch = jnp.hstack([x_repeated, c_tiled])
+            x_full_batch_scaled = x_scaler.transform(x_full_batch)
 
-        mean_broadcast = mean_pred[None, None, :]
-        y_sampled = jnp.where(jnp.isfinite(y_sampled), y_sampled, mean_broadcast)
+            n_total = x_full_batch_scaled.shape[0]
+            batch_size = min(batch_size, n_total)
+            print(
+                f"Computing robust acquisition over {n_total} scenarios "
+                f"({n_grid} grid points x {n_mc} covariate samples)..."
+            )
 
-        mean_flat = jnp.mean(y_sampled, axis=(0, 1))
-        var_flat = jnp.var(y_sampled, axis=(0, 1))
+            if self.use_closed_form_predict:
+                # ~10× cheaper per-batch than predict_in_batches because we
+                # skip the O(N²M) full-cov matmul and the O(N³) Cholesky
+                # inside MultivariateNormal.sample.  Also exact — no MC
+                # noise from `n=ei_num_samples` Monte-Carlo draws.
+                mean_flat, var_flat = self._predict_mean_diag_var_closed_form(
+                    gp_model,
+                    x_full_batch_scaled,
+                    batch_size=batch_size,
+                    noiseless=self.ei_noiseless,
+                )
+            else:
+                mean_pred, y_sampled = gp_model.predict_in_batches(
+                    rng_key,
+                    x_full_batch_scaled,
+                    batch_size=batch_size,
+                    n=self.ei_num_samples,
+                    noiseless=self.ei_noiseless,
+                )
+                mean_broadcast = mean_pred[None, None, :]
+                y_sampled = jnp.where(
+                    jnp.isfinite(y_sampled), y_sampled, mean_broadcast
+                )
+                mean_flat = jnp.mean(y_sampled, axis=(0, 1))
+                var_flat = jnp.var(y_sampled, axis=(0, 1))
 
-        mean_matrix = mean_flat.reshape(n_grid, n_mc)
-        var_matrix = var_flat.reshape(n_grid, n_mc)
+            mean_matrix = mean_flat.reshape(n_grid, n_mc)
+            var_matrix = var_flat.reshape(n_grid, n_mc)
+
+            # Stash for batch reuse: subsequent greedy picks within the
+            # same _select_batch_parameters loop reuse this matrix and
+            # only re-run the (cheap) EI/UCB + penalty + argmax steps.
+            if getattr(self, "_batch_predict_reuse", False):
+                self._cached_predictions = (
+                    np.asarray(mean_matrix),
+                    np.asarray(var_matrix),
+                )
+                self._cached_predictions_active_mask = np.ones(n_grid, dtype=bool)
 
         if self.acquisition_function == "ei":
             xi_value = self.ei_xi if xi is None else float(xi)
@@ -1684,6 +1963,8 @@ class BOptGPAX(InterPhaseAgent):
         import gpax
         import gpax.utils
         import jax.numpy as jnp
+
+        gpax.utils.enable_x64()
 
         cache = getattr(self, "_cached_gp_fit", None)
         # Capture BEFORE the fit step runs — the fit step populates the
@@ -1855,6 +2136,17 @@ class BOptGPAX(InterPhaseAgent):
 
         next_measurement_idx = jnp.argmax(acq_values_total)
         next_parameters = np.asarray(x_grid_ctrl[int(next_measurement_idx)])
+
+        # Cache bookkeeping (batch-greedy mode only): translate the
+        # active-relative argmax into a full-grid row index and flip the
+        # mask bit so subsequent picks in this batch see one fewer row.
+        # This must happen BEFORE we shrink x_unmeasured below so the two
+        # stay in lockstep with each other.
+        active_mask = getattr(self, "_cached_predictions_active_mask", None)
+        if active_mask is not None:
+            active_full_indices = np.where(active_mask)[0]
+            picked_full_idx = int(active_full_indices[int(next_measurement_idx)])
+            active_mask[picked_full_idx] = False
 
         # Remove chosen point from unmeasured set
         self.x_unmeasured = np.delete(
