@@ -123,6 +123,8 @@ class BOptGPAXSparse(BOptGPAX):
         import gpax.utils
         from scipy.stats import norm
 
+        gpax.utils.enable_x64()
+
         x_scaler = StandardScalerBounds()
         bounds, log_scale = self._get_bounds_and_log_scale()
         y_scaler = StandardScalerBounds()
