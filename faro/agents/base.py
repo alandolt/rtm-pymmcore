@@ -213,12 +213,23 @@ class InterPhaseAgent(Agent):
         )
 
     def _wait_for_pipeline(self, timeout: float = 120) -> None:
-        """Block until the Analyzer has drained its queues.
+        """Block until the current run finishes and the Analyzer drains.
 
-        Safe to call after ``controller.run_experiment()`` or
-        ``controller.continue_experiment()`` to ensure all frames have
-        been processed before reading results.
+        Call after ``controller.run_experiment()`` /
+        ``controller.continue_experiment()`` to ensure all frames have been
+        processed before reading results.
+
+        Those calls are *non-blocking*: they return a ``RunHandle`` and spawn
+        a worker thread that creates the Analyzer and feeds the engine. So we
+        first block on the run handle (until the feed loop finishes), *then*
+        drain the Analyzer's background queues. Without the handle wait,
+        ``_analyzer`` may not exist yet — or the feed loop may still be
+        running — and this would return prematurely, letting the agent read
+        an incomplete phase.
         """
+        handle = getattr(self.controller, "_current_handle", None)
+        if handle is not None:
+            handle.wait(timeout=timeout)
         analyzer = self.controller._analyzer
         if analyzer is None:
             return
