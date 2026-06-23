@@ -433,6 +433,8 @@ class FOVFinderAgent(PreExperimentAgent):
         strict_count: bool = True,
         return_json: bool | None = None,
         cycle_wells: bool = False,
+        replace_short_wells: bool = False,
+        max_well_replacements: int = 20,
         verbose: bool = False,
     ):
         """See class docstring.
@@ -506,6 +508,11 @@ class FOVFinderAgent(PreExperimentAgent):
         self.strict_count = bool(strict_count)
         self.return_json = bool(return_json) if return_json is not None else False
         self.cycle_wells = bool(cycle_wells)
+        # Skip-and-replace: if a well can't supply `fovs_per_well` valid
+        # candidates (>= min_cells), drop it and pull a fresh well from the
+        # queue instead of padding with below-threshold FOVs.
+        self.replace_short_wells = bool(replace_short_wells)
+        self.max_well_replacements = int(max_well_replacements)
         self.verbose = bool(verbose)
 
         self._plan = self._load_plan(well_plate_plan)
@@ -860,6 +867,37 @@ class FOVFinderAgent(PreExperimentAgent):
     # Main entry point
     # ------------------------------------------------------------------
 
+    def _scan_well_batch(self, wells, phase, z_value) -> pd.DataFrame:
+        """Generate candidates for ``wells``, acquire + segment them, and
+        return the scored candidate DataFrame (with a ``well`` column).
+
+        Factored out of :meth:`run` so the skip-and-replace loop can re-scan
+        replacement wells with identical logic.
+        """
+        all_candidates: list[FovPosition] = []
+        candidate_well: list[str] = []
+        for w_idx, well in enumerate(wells):
+            cx, cy = self._well_center_um(well)
+            seed_offset = (
+                None
+                if self.random_seed is None
+                else self.random_seed + 1000 * phase + w_idx
+            )
+            offsets = self._generate_candidate_offsets(
+                self.n_candidates_per_well, seed=seed_offset
+            )
+            for i, (dx, dy) in enumerate(offsets):
+                name = f"{self.name_prefix}_p{phase}_{well}__cand{i:03d}"
+                all_candidates.append(
+                    FovPosition(x=cx + dx, y=cy + dy, z=z_value, name=name)
+                )
+                candidate_well.append(well)
+
+        frames = self._acquire_frames(all_candidates)
+        df_scan = self._segment_and_score(all_candidates, frames)
+        df_scan["well"] = candidate_well
+        return df_scan
+
     def run(self) -> list[FovPosition] | list[Any]:
         """Find FOV positions for one phase.
 
@@ -881,14 +919,7 @@ class FOVFinderAgent(PreExperimentAgent):
             ``wells_for_positions`` list — is stashed on
             :attr:`last_run` after every call (overwritten each phase).
         """
-        wells = self.pick_next_wells()
         phase = self._phase_index
-        if self.verbose:
-            print(
-                f"[FOVFinderAgent] Phase {phase}: scanning "
-                f"{self.n_candidates_per_well} candidates in "
-                f"{len(wells)} wells: {wells}"
-            )
 
         # Resolve the Z value to write into this phase's candidate events.
         #   - None     -> leave Z untouched (PFS / pre-focused; no z_pos)
@@ -899,30 +930,77 @@ class FOVFinderAgent(PreExperimentAgent):
         else:
             z_value = self.z
 
-        # 1. Generate candidates for every well.
-        all_candidates: list[FovPosition] = []
-        candidate_well: list[str] = []
-        for w_idx, well in enumerate(wells):
-            cx, cy = self._well_center_um(well)
-            seed_offset = (
-                None
-                if self.random_seed is None
-                else self.random_seed + 1000 * phase + w_idx
-            )
-            offsets = self._generate_candidate_offsets(
-                self.n_candidates_per_well, seed=seed_offset
-            )
-            for i, (dx, dy) in enumerate(offsets):
-                name = f"{self.name_prefix}_p{phase}_{well}__cand{i:03d}"
-                all_candidates.append(
-                    FovPosition(x=cx + dx, y=cy + dy, z=z_value, name=name)
+        if not self.replace_short_wells:
+            # Default behaviour: scan exactly one batch of wells.
+            wells = self.pick_next_wells()
+            if self.verbose:
+                print(
+                    f"[FOVFinderAgent] Phase {phase}: scanning "
+                    f"{self.n_candidates_per_well} candidates in "
+                    f"{len(wells)} wells: {wells}"
                 )
-                candidate_well.append(well)
-
-        # 2. Acquire and segment.
-        frames = self._acquire_frames(all_candidates)
-        df_scan = self._segment_and_score(all_candidates, frames)
-        df_scan["well"] = candidate_well
+            df_scan = self._scan_well_batch(wells, phase, z_value)
+        else:
+            # Skip-and-replace: keep pulling wells until `wells_per_phase` of
+            # them each supply >= fovs_per_well valid candidates (>= min_cells),
+            # or the queue / max_well_replacements cap is exhausted. A well that
+            # falls short is dropped and a fresh well is tried instead.
+            target = self.wells_per_phase
+            accepted_wells: list[str] = []
+            df_parts: list[pd.DataFrame] = []
+            attempts = 0
+            try:
+                pending = self.pick_next_wells(target)
+            except RuntimeError:
+                pending = []
+            while pending:
+                if self.verbose:
+                    print(
+                        f"[FOVFinderAgent] Phase {phase}: scanning "
+                        f"{self.n_candidates_per_well} candidates in "
+                        f"{len(pending)} well(s): {pending}"
+                    )
+                df_b = self._scan_well_batch(pending, phase, z_value)
+                for w in pending:
+                    if len(accepted_wells) >= target:
+                        break
+                    n_valid = int(((df_b["well"] == w) & df_b["valid"]).sum())
+                    if n_valid >= self.fovs_per_well:
+                        accepted_wells.append(w)
+                        df_parts.append(df_b[df_b["well"] == w])
+                    elif self.verbose:
+                        print(
+                            f"[FOVFinderAgent] well {w}: only {n_valid}/"
+                            f"{self.fovs_per_well} valid FOVs (>= {self.min_cells} "
+                            f"cells); skipping and trying another well."
+                        )
+                if len(accepted_wells) >= target:
+                    break
+                attempts += 1
+                if attempts > self.max_well_replacements:
+                    if self.verbose:
+                        print(
+                            f"[FOVFinderAgent] reached max_well_replacements="
+                            f"{self.max_well_replacements}; proceeding with "
+                            f"{len(accepted_wells)}/{target} wells."
+                        )
+                    break
+                try:
+                    pending = self.pick_next_wells(target - len(accepted_wells))
+                except RuntimeError:
+                    if self.verbose:
+                        print(
+                            f"[FOVFinderAgent] well queue exhausted; proceeding "
+                            f"with {len(accepted_wells)}/{target} wells."
+                        )
+                    break
+            wells = accepted_wells
+            if df_parts:
+                df_scan = pd.concat(df_parts, ignore_index=True)
+            else:
+                df_scan = pd.DataFrame(
+                    columns=["x", "y", "n_cells", "valid", "reason", "well"]
+                )
 
         # 3. For each well, farthest-point pick fovs_per_well valid points.
         #    Track wells parallel to selected positions so callers don't
@@ -1028,9 +1106,25 @@ class FOVFinderAgent(PreExperimentAgent):
             ]
             n = int(row["n_cells"].iloc[0]) if not row.empty else "?"
             valid = bool(row["valid"].iloc[0]) if not row.empty else "?"
-            tag = (
-                "" if valid is True else " (below min_cells)" if valid is False else ""
+            # Show the ACTUAL rejection reason (below_min_cells,
+            # above_max_cells, feature_extraction_empty, condition_failed:...,
+            # missing_frame), not a hardcoded "below min_cells" — an FOV with
+            # plenty of cells can still be rejected by a failing FOVCondition.
+            reason = (
+                str(row["reason"].iloc[0])
+                if (
+                    not row.empty
+                    and "reason" in row.columns
+                    and pd.notna(row["reason"].iloc[0])
+                )
+                else ""
             )
+            if valid is True:
+                tag = ""
+            elif valid is False:
+                tag = f" (rejected: {reason})" if reason else " (rejected)"
+            else:
+                tag = ""
 
             # Per-condition stats: mean of the feature across cells AND the
             # fraction of cells that satisfied the threshold.  Both columns
@@ -1088,7 +1182,7 @@ class FOVFinderAgent(PreExperimentAgent):
                 "phase": phase,
                 "wells_used": list(wells),
                 "n_selected": len(selected),
-                "n_candidates": len(all_candidates),
+                "n_candidates": len(df_scan),
             }
         )
         self._phase_index += 1
