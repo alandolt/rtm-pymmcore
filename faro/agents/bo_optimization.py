@@ -45,6 +45,7 @@ class BO_Parameter:
     param_type: str = "float"  # 'int' or 'float'
     spacing: float = 10.0
     log_scale: bool = False
+    n_grid: int = None  # for log_scale: number of log-spaced candidate points
     initial_value: float = None
 
 
@@ -1342,7 +1343,24 @@ class BOptGPAX(InterPhaseAgent):
         param_grids = []
         for param in self.parameters_to_optimize:
             spacing = param.spacing if param.spacing is not None else 1.0
-            grid = np.arange(param.bounds[0], param.bounds[1] + spacing, spacing)
+            if getattr(param, "log_scale", False):
+                lo, hi = param.bounds
+                if lo <= 0:
+                    raise ValueError(
+                        f"log_scale parameter {param.name!r} requires bounds[0] > 0, "
+                        f"got {lo}. Use a small positive lower bound; deliver the "
+                        f"zero-dose control separately (exposure 0 is skipped)."
+                    )
+                # log axis: candidates are log-spaced. `n_grid` sets the point
+                # count; if unset, match the count a linear grid would have so
+                # density is preserved but redistributed across decades.
+                if getattr(param, "n_grid", None):
+                    n_points = max(2, int(param.n_grid))
+                else:
+                    n_points = max(2, int(np.floor((hi - lo) / spacing)) + 1)
+                grid = np.geomspace(lo, hi, n_points)
+            else:
+                grid = np.arange(param.bounds[0], param.bounds[1] + spacing, spacing)
             param_grids.append(grid)
         mesh = np.meshgrid(*param_grids, indexing="ij")
         flat_mesh = [m.flatten() for m in mesh]
