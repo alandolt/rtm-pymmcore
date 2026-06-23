@@ -207,6 +207,7 @@ class TwoTaskDoseResponseBO(DoseResponseBO):
         lengthscale_prior_dist: Optional[dist.Distribution] = None,
         peak_ratio: float = 1.5,
         peak_min_consecutive_frames: int = 2,
+        response_window_frames: Optional[int] = None,
         gp_kernel: str = "Matern",
         gp_num_warmup: int = 400,
         gp_num_samples: int = 800,
@@ -224,6 +225,12 @@ class TwoTaskDoseResponseBO(DoseResponseBO):
 
         self.peak_ratio = float(peak_ratio)
         self.peak_min_consecutive_frames = int(peak_min_consecutive_frames)
+        # If set, restrict peak-detection / responder calls to the first
+        # `response_window_frames` post-stim frames (the early ERK-KTR transient)
+        # instead of the full observation tail.
+        self.response_window_frames = (
+            int(response_window_frames) if response_window_frames else None
+        )
         self.gp_kernel = gp_kernel
         self.gp_num_warmup = int(gp_num_warmup)
         self.gp_num_samples = int(gp_num_samples)
