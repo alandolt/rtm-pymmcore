@@ -811,14 +811,24 @@ class RTMSequence(MDASequence):
                 if self.stim_exposure is None:
                     stim = stim_tuple
                 elif isinstance(self.stim_exposure, (int, float)):
-                    stim = tuple(
-                        _channel_with_exposure(ch, self.stim_exposure)
-                        for ch in stim_tuple
+                    # exposure <= 0 => zero-dose control: deliver no stim pulse
+                    # at all (no SLM event, no hardware call, no camera-minimum
+                    # validation). The dose is still recorded via metadata, so
+                    # the BO sees a genuine 0 ms condition.
+                    stim = (
+                        ()
+                        if self.stim_exposure <= 0
+                        else tuple(
+                            _channel_with_exposure(ch, self.stim_exposure)
+                            for ch in stim_tuple
+                        )
                     )
                 else:
                     exp = stim_exposure_map[t]
-                    stim = tuple(
-                        _channel_with_exposure(ch, exp) for ch in stim_tuple
+                    stim = (
+                        ()
+                        if exp <= 0
+                        else tuple(_channel_with_exposure(ch, exp) for ch in stim_tuple)
                     )
             else:
                 stim = ()
