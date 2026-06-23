@@ -1,0 +1,46 @@
+{
+  "plate": {
+    "rows": 8,
+    "columns": 12,
+    "well_spacing": [
+      9.0,
+      9.0
+    ],
+    "well_size": [
+      6.4,
+      6.4
+    ],
+    "name": "96-well"
+  },
+  "a1_center_xy": [
+    54831.5615,
+    -32014.7363
+  ],
+  "rotation": -179.87,
+  "selected_wells": [
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "well_points_plan": {
+    "fov_width": null,
+    "fov_height": null
+  }
+}

@@ -9,6 +9,7 @@ from faro.agents.bo_dose_response import DoseResponseBO
 from faro.agents.bo_oscillation import OscillationBO
 from faro.agents.composed import ComposedAgent
 from faro.agents.condition_monitor import ConditionMonitorAgent
+from faro.agents.fov_condition_monitor import FOVConditionMonitorAgent
 from faro.agents.fov_finder import FOVCondition, FOVFinderAgent
 
 # BoTorch-based agents (lazy import — only available when botorch is installed)
@@ -26,6 +27,7 @@ __all__ = [
     "ConditionMonitorAgent",
     "DoseResponseBO",
     "FOVCondition",
+    "FOVConditionMonitorAgent",
     "FOVFinderAgent",
     "IntraExperimentAgent",
     "InterPhaseAgent",
