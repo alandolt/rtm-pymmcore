@@ -96,6 +96,16 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         except Exception:
             return None
 
+    def get_position(self) -> tuple[float, float] | None:
+        """Read the current XY stage position (µm) via pymmcore-plus."""
+        if self.mmc is None:
+            return None
+        try:
+            x, y = self.mmc.getXYPosition()
+            return float(x), float(y)
+        except Exception:
+            return None
+
     def resolve_group(self, config_name: str) -> str:
         """Return the channel group for *config_name*, auto-detecting if needed."""
         if self._current_group is None:
@@ -206,6 +216,7 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         if self.mmc is None:
             return ok  # nothing else to validate against
         from faro.core.utils import validate_hardware
+
         ok_mmc = validate_hardware(
             events, self.mmc, power_properties=self.get_power_properties()
         )

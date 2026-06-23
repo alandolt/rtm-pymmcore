@@ -79,6 +79,17 @@ class AbstractMicroscope:
         """
         return None
 
+    def get_position(self) -> tuple[float, float] | None:
+        """Return the current (X, Y) stage position in µm, if available.
+
+        Microscope-agnostic accessor used by agents that need to snapshot
+        the current stage position without reaching into a backend-specific
+        API (e.g. ``mmc.getXYPosition()``).  Subclasses should override.
+        The base implementation returns ``None`` to signal "XY readout not
+        supported on this backend".
+        """
+        return None
+
     def resolve_group(self, config_name) -> str:
         """Return channel group for config name. Optional override."""
         return ""
