@@ -18,6 +18,16 @@ class Jungfrau(PyMMCoreMicroscope):
     USE_AUTOFOCUS_EVENT = False
     USE_ONLY_PFS = True
 
+    POWER_PROPERTIES = {
+        "CyanStim": ("Spectra", "Cyan_Level"),  # state 4  (pre-existing, known good)
+        "mScarlet3": (
+            "Spectra",
+            "Green_Level",
+        ),  # state 16, confirmed on scope 2026-06-22
+        "miRFP": ("Spectra", "Red_Level"),  # state 32, inferred from cfg labels
+        "mCitrine": ("Spectra", "Teal_Level"),  # state 8,  inferred from cfg labels
+    }
+
     def __init__(self):
         super().__init__()
         pymmcore_plus.configure_logging(file=None, stderr_level="CRITICAL")
