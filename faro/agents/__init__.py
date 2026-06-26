@@ -11,6 +11,14 @@ from faro.agents.composed import ComposedAgent
 from faro.agents.condition_monitor import ConditionMonitorAgent
 from faro.agents.fov_condition_monitor import FOVConditionMonitorAgent
 from faro.agents.fov_finder import FOVCondition, FOVFinderAgent
+from faro.agents.well_pattern import (
+    FOVFinder,
+    ResolvedWellPatterns,
+    WellPattern,
+    resolve_well_patterns,
+    run_well_patterns,
+    run_well_patterns_async,
+)
 
 # BoTorch-based agents (lazy import — only available when botorch is installed)
 try:
@@ -28,10 +36,16 @@ __all__ = [
     "DoseResponseBO",
     "FOVCondition",
     "FOVConditionMonitorAgent",
+    "FOVFinder",
     "FOVFinderAgent",
     "IntraExperimentAgent",
     "InterPhaseAgent",
     "OscillationBO",
     "OscillationBOBoTorch",
     "PreExperimentAgent",
+    "ResolvedWellPatterns",
+    "WellPattern",
+    "resolve_well_patterns",
+    "run_well_patterns",
+    "run_well_patterns_async",
 ]

@@ -75,6 +75,27 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     # ------------------------------------------------------------------
 
     def run_mda(self, event_iter):
+        # A running live/continuous sequence and the MDA both drive the same
+        # camera. If live is still acquiring when the MDA's first snap fires,
+        # the snap buffer is consumed by the live listener before the engine
+        # reads it ("Camera image buffer read failed"). Stop it here, in the
+        # single shared entry point for pymmcore-based scopes, so *every*
+        # caller is protected — not just Controller.run_experiment (which
+        # already does this) but also agents that drive run_mda directly
+        # (FOVFinderAgent / FOVConditionMonitorAgent scans, and any future
+        # direct caller). Re-checked on every call, so a live link that
+        # auto-restarts between scans can't re-introduce the contention.
+        #
+        # TODO: check compatibility with non-pymmcore scopes. This guard lives
+        # in PyMMCoreMicroscope, so every concrete backend today (Jungfrau,
+        # Moench, Niesen, MMDemo, proxy, UniMMCoreSimulation) inherits it. A
+        # future backend that subclasses AbstractMicroscope directly (e.g. a
+        # pure useq-engine / non-mmcore scope) would NOT get it and would need
+        # its own live-stop equivalent — consider lifting this to an
+        # overridable AbstractMicroscope hook (default no-op) if/when that
+        # lands.
+        if self.mmc is not None and self.mmc.isSequenceRunning():
+            self.mmc.stopSequenceAcquisition()
         return self.mmc.run_mda(event_iter)
 
     def connect_frame(self, callback):

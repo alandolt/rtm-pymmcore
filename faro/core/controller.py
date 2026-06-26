@@ -1,6 +1,12 @@
 from faro.core.pipeline import store_img, ImageProcessingPipeline
-from faro.core.data_structures import FovState, FrameWaitCancelled, ImgType, StimMode, WaitEvent
-from faro.core.run_status import RunHandle, RunStatus
+from faro.core.data_structures import (
+    FovState,
+    FrameWaitCancelled,
+    ImgType,
+    StimMode,
+    WaitEvent,
+)
+from faro.core.run_status import OrchestratorHandle, RunHandle, RunStatus
 from faro.core.writers import (
     Writer,
     TiffWriter,
@@ -15,6 +21,7 @@ from faro.core.writers import (
 from faro.stimulation.base import Stim, StimWithImage, StimWithPipeline
 
 import contextlib
+import inspect
 import threading
 import traceback
 from dataclasses import dataclass
@@ -61,14 +68,14 @@ class QueueStats:
       permanently behind.
     """
 
-    storage_depth: int        # images buffered, awaiting disk write
-    storage_max: int          # storage queue capacity
-    pipeline_inflight: int    # pipeline tasks submitted, not yet finished
-    pipeline_max: int         # depth at which new frames get deferred
-    deferred_depth: int       # frames deferred for later reprocessing
-    stored_images: int        # cumulative images written
-    skipped_pipeline: int     # cumulative frames deferred
-    deferred_processed: int   # cumulative deferred frames later processed
+    storage_depth: int  # images buffered, awaiting disk write
+    storage_max: int  # storage queue capacity
+    pipeline_inflight: int  # pipeline tasks submitted, not yet finished
+    pipeline_max: int  # depth at which new frames get deferred
+    deferred_depth: int  # frames deferred for later reprocessing
+    stored_images: int  # cumulative images written
+    skipped_pipeline: int  # cumulative frames deferred
+    deferred_processed: int  # cumulative deferred frames later processed
 
 
 class Analyzer:
@@ -445,9 +452,7 @@ class Analyzer:
             future = self.executor.submit(
                 self.pipeline.run, img=img, event=event, file_path=None
             )
-            future.add_done_callback(
-                self._make_pipeline_done_callback(event, metadata)
-            )
+            future.add_done_callback(self._make_pipeline_done_callback(event, metadata))
             if self.debug:
                 print(
                     f"[Analyzer] Pipeline submitted (active={self.active_pipeline_tasks}, pending_deferred={self._deferred_queue.qsize()})"
@@ -613,9 +618,7 @@ class Analyzer:
                     try:
                         fov_idx = metadata.get("fov", 0)
                         frame_idx = event.index.get("t", 0)
-                        self.get_fov_state(fov_idx).tracks_queue.skip_frame(
-                            frame_idx
-                        )
+                        self.get_fov_state(fov_idx).tracks_queue.skip_frame(frame_idx)
                     except Exception:
                         pass
 
@@ -667,9 +670,7 @@ class Analyzer:
         if self.writer is not None:
             self.writer.close()
 
-    def wait_idle(
-        self, timeout: float | None = 30.0, poll: float = 0.05
-    ) -> bool:
+    def wait_idle(self, timeout: float | None = 30.0, poll: float = 0.05) -> bool:
         """Block until storage, pipeline, and deferred queues all drain.
 
         Returns True if idle was reached before the timeout, False
@@ -718,6 +719,10 @@ class Controller:
     # carrying the freshly-created RunHandle. Widgets subscribe to this so
     # they can re-bind to whichever run is current.
     runStarted = Signal(object)
+
+    # Emitted with the OrchestratorHandle when a multi-run orchestrator
+    # (agent loop, batch driver, ...) is launched via run_orchestrator_async.
+    orchestratorStarted = Signal(object)
 
     def __init__(self, mic, pipeline, *, writer: Writer | None = None, agent=None):
         """
@@ -773,6 +778,11 @@ class Controller:
         # Current run handle (None when no run is in progress / between runs).
         # The worker thread owns it; status update sites use it via this attr.
         self._current_handle: RunHandle | None = None
+
+        # Current orchestrator handle (None when no multi-run orchestrator is
+        # active). Distinct from _current_handle, which tracks the single
+        # acquisition the orchestrator is currently driving.
+        self._orchestrator_handle: OrchestratorHandle | None = None
 
         # (p, t) index of the RTMEvent whose frames are currently arriving.
         # _bump_status_for_frame uses it to detect RTMEvent boundaries so
@@ -956,6 +966,144 @@ class Controller:
                 "handle.cancel() first."
             )
 
+    def run_orchestrator_async(
+        self, orchestrator, /, *args, name: str = "FaroOrchestrator", **kwargs
+    ) -> OrchestratorHandle:
+        """Run a blocking multi-run orchestrator on a worker thread.
+
+        Single acquisitions are launched asynchronously by
+        :meth:`run_experiment`. A *multi-run* orchestrator — an agent loop that
+        interleaves FOV finding / analysis with several ``run_experiment`` /
+        ``continue_experiment`` calls (e.g. :meth:`ComposedAgent.run` or
+        :func:`faro.agents.run_well_patterns`) — is inherently synchronous: it
+        must wait for each acquisition to finish before deciding the next one.
+        Calling it directly therefore blocks the kernel (and freezes a napari
+        UI). This wraps such a callable on a daemon worker thread and returns
+        an :class:`OrchestratorHandle` immediately, so the experiment runs in
+        the background and the caller keeps a ``wait()`` / ``cancel()`` /
+        ``statusChanged`` handle — the same contract as ``run_experiment``,
+        one level up.
+
+        Cancellation is two-tiered: ``handle.cancel()`` aborts the in-flight
+        acquisition (via the per-run handle) **and** sets a cancel event the
+        orchestrator can poll between sub-runs to stop cleanly.
+
+        Cooperation is injected by signature introspection (so orchestrators
+        opt in without this method knowing their internals):
+
+        * if *orchestrator* accepts a ``progress`` parameter, the whole
+          :class:`OrchestratorHandle` is passed — the orchestrator can poll
+          ``progress.cancelled`` and report ``progress.report_progress(step,
+          n_steps, msg)``;
+        * else if it accepts ``cancel_event``, just the cancel
+          :class:`threading.Event` is passed (cancellation only).
+
+        Either way, ``handle.current_run`` is kept pointing at the acquisition
+        the orchestrator currently drives — the controller subscribes to its
+        own ``runStarted`` signal for the orchestrator's lifetime, so a widget
+        bound to the handle can drill into per-event progress without the
+        orchestrator doing anything. Orchestrators that take neither parameter
+        are still cancellable at acquisition granularity.
+
+        Args:
+            orchestrator: The blocking callable to run (positional-only).
+            *args / **kwargs: Forwarded to *orchestrator*.
+            name: Worker-thread name (for debugging).
+
+        Returns:
+            An :class:`OrchestratorHandle`. Call ``wait()`` to block until the
+            orchestrator finishes (re-raises any error it raised).
+
+        Raises:
+            RuntimeError: If another orchestrator is already running.
+        """
+        if (
+            self._orchestrator_handle is not None
+            and self._orchestrator_handle.is_running()
+        ):
+            raise RuntimeError(
+                "An orchestrator is already running. Call handle.wait() or "
+                "handle.cancel() first."
+            )
+
+        handle = OrchestratorHandle(on_cancel=self._cancel_current_run)
+        self._orchestrator_handle = handle
+
+        # Inject cooperation by introspection: prefer the full handle
+        # (``progress`` -> cancel + progress reporting); fall back to the bare
+        # cancel event (``cancel_event`` -> cancellation only).
+        try:
+            params = inspect.signature(orchestrator).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "progress" in params and "progress" not in kwargs:
+            kwargs = {**kwargs, "progress": handle}
+        elif "cancel_event" in params and "cancel_event" not in kwargs:
+            kwargs = {**kwargs, "cancel_event": handle.cancel_event}
+
+        # Keep handle.current_run pointing at whichever acquisition the
+        # orchestrator is driving: the per-run handle is published on
+        # runStarted by run_experiment / continue_experiment. The subscription
+        # lives only for this orchestrator's lifetime (disconnected in the
+        # worker's finally) so handles don't leak across orchestrators.
+        def _on_run_started(run_handle) -> None:
+            handle._set_current_run(run_handle)
+
+        self.runStarted.connect(_on_run_started)
+
+        def _worker() -> None:
+            handle.update(state="running", started_at=time.monotonic())
+            try:
+                orchestrator(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - surfaced via handle
+                traceback.print_exc()
+                handle.update(state="error", error=exc, finished_at=time.monotonic())
+            else:
+                handle.update(
+                    state="done",
+                    finished_at=time.monotonic(),
+                    message="cancelled" if handle.cancelled else None,
+                )
+            finally:
+                try:
+                    self.runStarted.disconnect(_on_run_started)
+                except Exception:
+                    pass
+
+        handle._thread = threading.Thread(target=_worker, name=name, daemon=True)
+        handle._thread.start()
+        self.orchestratorStarted.emit(handle)
+        return handle
+
+    def _cancel_current_run(self) -> None:
+        """OrchestratorHandle ``on_cancel`` hook — abort whatever is in flight.
+
+        Cancelling an orchestrator must promptly stop whatever it currently
+        has driving the camera so the worker's ``handle.wait()`` returns and
+        the orchestrator can observe its cancel event and exit, instead of
+        blocking until the current step finishes on its own. Two cases:
+
+        * an *acquisition* run behind a RunHandle (a batch's
+          ``run_experiment`` / ``continue_experiment``) — cancel the handle so
+          its feed loop unwinds gracefully;
+        * a *direct* ``mic.run_mda`` with no RunHandle — e.g. a FOV-finder
+          scan the orchestrator is running between batches. That isn't behind
+          a handle, so we abort it at the engine level via ``cancel_mda`` (the
+          finder's ``thread.join()`` then returns and the orchestrator's
+          cancel checks take over).
+
+        Both are best-effort and safe to call when nothing is running.
+        """
+        run_handle = self._current_handle
+        if run_handle is not None and run_handle.is_running():
+            run_handle.cancel()
+        # Abort any engine-level MDA (finder scan, or the batch run as a
+        # backstop if its feed loop is parked between far-apart timepoints).
+        try:
+            self._mic.cancel_mda()
+        except Exception:
+            pass
+
     def _cancel_stim_waits(self) -> None:
         """RunHandle ``on_cancel`` hook — wake a feed loop blocked on a stim mask.
 
@@ -1080,9 +1228,7 @@ class Controller:
 
         except BaseException as exc:
             traceback.print_exc()
-            handle.update(
-                state="error", fatal_error=exc, finished_at=time.monotonic()
-            )
+            handle.update(state="error", fatal_error=exc, finished_at=time.monotonic())
         else:
             # Update wall-clock offset for continuation
             if self._experiment_start is not None:
@@ -1187,12 +1333,8 @@ class Controller:
                     # shutdown is the gate — only snapshot background_errors
                     # and drop the Analyzer once it succeeds. On TimeoutError
                     # the Analyzer is still alive and the caller can retry.
-                    self._analyzer.shutdown(
-                        wait=True, drain_timeout=drain_timeout
-                    )
-                    self.background_errors.extend(
-                        self._analyzer.background_errors
-                    )
+                    self._analyzer.shutdown(wait=True, drain_timeout=drain_timeout)
+                    self.background_errors.extend(self._analyzer.background_errors)
                     self._analyzer = None
                 self._t_offset = 0
                 self._time_offset = 0.0
@@ -1206,9 +1348,7 @@ class Controller:
             finally:
                 done.set()
 
-        threading.Thread(
-            target=_teardown, name="FaroFinishWorker", daemon=True
-        ).start()
+        threading.Thread(target=_teardown, name="FaroFinishWorker", daemon=True).start()
         while not done.wait(timeout=0.05):
             self._pump_qt_events()
         if box:
@@ -1239,7 +1379,23 @@ class Controller:
         return analyzer.queue_stats() if analyzer is not None else None
 
     def stop_run(self):
-        """Hard-stop the run path (legacy). Prefer ``handle.cancel()``."""
+        """Stop the current run. Prefer ``handle.cancel()`` / ``run_handle.cancel()``.
+
+        If an async orchestrator (``run_orchestrator_async``) is active, cancel
+        *it* — this aborts the in-flight acquisition/scan **and** sets the
+        orchestrator's cancel event so its loop stops between sub-runs (and the
+        orchestrator closes the store via its own ``finish``). A plain
+        ``stop_run`` that only cancelled ``_current_handle`` would abort one
+        batch while the orchestrator marched on to the next and then errored on
+        the torn-down analyzer — which is why ``stop_run`` "did nothing" for an
+        orchestrator run.
+
+        Otherwise, hard-stop the single (non-orchestrated) run path.
+        """
+        orch = self._orchestrator_handle
+        if orch is not None and orch.is_running():
+            orch.cancel()
+            return
         if self._current_handle is not None:
             self._current_handle.cancel()
         self._queue.put(self.STOP_EVENT)
@@ -1410,8 +1566,12 @@ class Controller:
                     # A pause-drain can push wallclock past the scheduled
                     # window; without max() the wait would flash through.
                     scheduled_start = base + (rtm_event.min_start_time or 0)
-                    deadline = max(scheduled_start, time.monotonic()) + rtm_event.duration_s
-                    handle.update(state="waiting", wait_remaining_s=rtm_event.duration_s)
+                    deadline = (
+                        max(scheduled_start, time.monotonic()) + rtm_event.duration_s
+                    )
+                    handle.update(
+                        state="waiting", wait_remaining_s=rtm_event.duration_s
+                    )
                     last_displayed = int(rtm_event.duration_s)
                     while True:
                         remaining = deadline - time.monotonic()
@@ -1469,8 +1629,7 @@ class Controller:
                 # mode (commit ca69abc), so peek_at_frame finds the
                 # predecessor's mask for every t > 0.
                 suppress_stim = (
-                    stim_mode == "previous"
-                    and rtm_event.index.get("t", 0) == 0
+                    stim_mode == "previous" and rtm_event.index.get("t", 0) == 0
                 )
 
                 # Defer stim-mask computation so imaging events reach
@@ -1557,7 +1716,9 @@ class Controller:
             updates["n_events_acquired"] = prev.n_events_acquired + 1
             if prev.started_at is None:
                 # Anchor elapsed clock to first acquisition (matches _lag_origin).
-                exposure_s_for_start = (getattr(event, "exposure", None) or 0.0) / 1000.0
+                exposure_s_for_start = (
+                    getattr(event, "exposure", None) or 0.0
+                ) / 1000.0
                 updates["started_at"] = time.monotonic() - exposure_s_for_start
             # Lag = how far this RTMEvent's acquisition start drifted from
             # its scheduled min_start_time. frameReady fires when the frame
@@ -1581,9 +1742,7 @@ class Controller:
                     # First frame defines t0: its acquisition start
                     # corresponds to this event's scheduled min_start_time.
                     self._lag_origin = acq_start - min_start
-                updates["lag_ms"] = (
-                    acq_start - self._lag_origin - min_start
-                ) * 1000.0
+                updates["lag_ms"] = (acq_start - self._lag_origin - min_start) * 1000.0
         handle.update(**updates)
 
     def _on_frame_ready(self, img: np.ndarray, event: MDAEvent) -> None:

@@ -140,8 +140,20 @@ class ComposedAgent(InterPhaseAgent):
     # Main loop
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
-        """Run all phases sequentially."""
+    def run(self, *, progress=None) -> None:
+        """Run all phases sequentially.
+
+        Args:
+            progress: Optional
+                :class:`~faro.core.run_status.OrchestratorHandle`; checked
+                before each phase (``progress.cancelled``) to stop cleanly,
+                and updated per phase (``progress.report_progress``) so a
+                widget shows "phase i/n" and can drill into the phase's run via
+                ``progress.current_run``.  Injected automatically when launched
+                via
+                :meth:`~faro.core.controller.Controller.run_orchestrator_async`,
+                which also aborts the in-flight acquisition on cancel.
+        """
         if self.controller is None:
             raise RuntimeError(
                 "ComposedAgent has no controller; instantiate via "
@@ -149,6 +161,16 @@ class ComposedAgent(InterPhaseAgent):
             )
 
         for phase in range(self.n_phases):
+            if progress is not None and progress.cancelled:
+                print(
+                    f"[ComposedAgent] cancelled before phase {phase + 1}/"
+                    f"{self.n_phases}; stopping."
+                )
+                break
+            if progress is not None:
+                progress.report_progress(
+                    phase, self.n_phases, f"phase {phase + 1}/{self.n_phases}"
+                )
             print(
                 f"\n{'=' * 60}\n"
                 f"=== ComposedAgent: phase {phase + 1}/{self.n_phases} ===\n"

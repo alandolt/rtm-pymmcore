@@ -16,6 +16,7 @@ loaded :mod:`psygnal` routes the emission to listeners' threads through
 Qt's queued connections, so a napari widget connected on the main thread
 sees a queued slot call from the worker without extra plumbing.
 """
+
 from __future__ import annotations
 
 import threading
@@ -48,13 +49,17 @@ class RunStatus:
     #  - n_frames_received counts MDAEvents (individual channel snaps).
     # Widgets must compare like-with-like: progress is n_events_acquired
     # / n_events_total, NOT n_frames_received / n_events_total.
-    n_events_total: int = 0          # how many RTMEvents the run was started with
-    n_events_consumed: int = 0       # RTMEvents pulled by the feed loop so far
-    n_events_acquired: int = 0       # RTMEvents whose first frame has arrived (WaitEvents bump on completion)
-    n_frames_received: int = 0       # MDAEvent frames acknowledged via frameReady
+    n_events_total: int = 0  # how many RTMEvents the run was started with
+    n_events_consumed: int = 0  # RTMEvents pulled by the feed loop so far
+    n_events_acquired: int = (
+        0  # RTMEvents whose first frame has arrived (WaitEvents bump on completion)
+    )
+    n_frames_received: int = 0  # MDAEvent frames acknowledged via frameReady
     # Timing.
-    started_at: float | None = None       # time.monotonic() when the first frame began acquiring
-    finished_at: float | None = None      # time.monotonic() when the worker exited
+    started_at: float | None = (
+        None  # time.monotonic() when the first frame began acquiring
+    )
+    finished_at: float | None = None  # time.monotonic() when the worker exited
     last_frame_wallclock: float | None = None
     # Lag: how late the *current RTMEvent* started acquiring vs its
     # scheduled min_start_time, in ms. Measured once per RTMEvent (on its
@@ -227,3 +232,182 @@ class RunHandle:
             new_status = self._status
         self.statusChanged.emit(new_status)
         return new_status
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator-level async handle
+# ---------------------------------------------------------------------------
+#
+# A *single* acquisition is driven by ``run_experiment`` and reported via
+# ``RunHandle`` (event counts, frame counts, lag, ...). A multi-run
+# *orchestrator* — an agent loop that interleaves FOV finding / analysis with
+# several ``run_experiment`` / ``continue_experiment`` calls (e.g.
+# ``ComposedAgent.run``, ``run_well_patterns``) — needs a coarser handle: it
+# spans many runs, so per-event counters do not apply. ``OrchestratorHandle``
+# mirrors ``RunHandle``'s public surface (``wait`` / ``cancel`` / ``status`` /
+# ``statusChanged`` / ``is_running``) so widgets and callers treat both the
+# same way.
+
+OrchestratorState = Literal["pending", "running", "cancelling", "done", "error"]
+
+
+@dataclass(frozen=True)
+class OrchestratorStatus:
+    """Immutable snapshot of a multi-run orchestrator."""
+
+    state: OrchestratorState = "pending"
+    # Free-text progress note set by the orchestrator (e.g. "batch 3/15").
+    message: str | None = None
+    # Structured step counter set by the orchestrator: ``step`` is the
+    # 0-based index of the sub-run currently being prepared/run, ``n_steps``
+    # the total (e.g. number of phases / batches). Either may be None when the
+    # orchestrator doesn't report progress.
+    step: int | None = None
+    n_steps: int | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    # Set when the orchestrator callable raised; re-raised by ``wait()``.
+    error: BaseException | None = None
+
+
+class OrchestratorHandle:
+    """Handle returned by ``Controller.run_orchestrator_async``.
+
+    Wraps a blocking orchestrator callable running on a worker thread. Use
+    ``wait()`` to block until it finishes, ``cancel()`` to request a graceful
+    stop (the orchestrator polls :attr:`cancel_event` between sub-runs, and the
+    controller's ``on_cancel`` hook aborts the in-flight acquisition), or
+    subscribe to ``statusChanged`` for live updates.
+
+    For drill-down, :attr:`current_run` exposes the per-acquisition
+    :class:`RunHandle` the orchestrator is currently driving (``None`` before
+    the first run / between runs). It is updated by the controller as each
+    sub-run starts; subscribe to ``currentRunChanged`` to re-bind a detail
+    view (e.g. an event-progress widget) to the live batch. A single widget
+    can therefore show orchestrator-level progress (``status().message`` /
+    ``step`` / ``n_steps``) and drill into ``current_run.status()`` for the
+    current run's per-event detail.
+    """
+
+    statusChanged = Signal(OrchestratorStatus)
+    # Emitted with the new per-acquisition RunHandle (or None) whenever the
+    # orchestrator advances to a different sub-run. Lets a detail widget
+    # re-bind without polling.
+    currentRunChanged = Signal(object)
+
+    def __init__(self, *, on_cancel: Callable[[], None] | None = None) -> None:
+        self._lock = threading.RLock()
+        self._status = OrchestratorStatus(state="pending")
+        self._cancel_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        # Run synchronously on the canceller's thread the first time cancel()
+        # is called: the controller uses it to abort the in-flight per-run
+        # acquisition so cancellation is prompt, not bounded by the current
+        # batch's remaining duration.
+        self._on_cancel = on_cancel
+        # The per-acquisition RunHandle currently being driven (None between
+        # runs). Populated by the controller via _set_current_run.
+        self._current_run: "RunHandle | None" = None
+
+    # -- public API ---------------------------------------------------------
+
+    def status(self) -> OrchestratorStatus:
+        """Return the current immutable status snapshot."""
+        with self._lock:
+            return self._status
+
+    def wait(self, timeout: float | None = None) -> OrchestratorStatus:
+        """Block until the orchestrator thread finishes (or ``timeout``).
+
+        Returns the final status. Re-raises the orchestrator's ``error`` if it
+        crashed, mirroring ``RunHandle.wait``.
+        """
+        if self._thread is not None:
+            self._thread.join(timeout)
+        status = self.status()
+        if status.error is not None:
+            raise status.error
+        return status
+
+    def cancel(self) -> None:
+        """Request graceful cancellation. Idempotent. Does not block.
+
+        Sets :attr:`cancel_event` (polled by the orchestrator between sub-runs)
+        and invokes ``on_cancel`` once to abort the acquisition currently in
+        flight. Call ``wait()`` afterwards to block until the orchestrator
+        actually stops.
+        """
+        first_cancel = not self._cancel_event.is_set()
+        self._cancel_event.set()
+        if first_cancel and self._on_cancel is not None:
+            try:
+                self._on_cancel()
+            except Exception:
+                traceback.print_exc()
+        with self._lock:
+            if self._status.state in ("pending", "running"):
+                self._status = replace(self._status, state="cancelling")
+                new_status = self._status
+            else:
+                return
+        self.statusChanged.emit(new_status)
+
+    def is_running(self) -> bool:
+        """True if the orchestrator worker thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def cancelled(self) -> bool:
+        """True if cancellation has been requested."""
+        return self._cancel_event.is_set()
+
+    @property
+    def current_run(self) -> "RunHandle | None":
+        """The per-acquisition RunHandle currently being driven (or None).
+
+        Read-only for callers; the controller updates it via
+        :meth:`_set_current_run` as each sub-run starts. Pair with
+        ``currentRunChanged`` to re-bind a detail view live.
+        """
+        with self._lock:
+            return self._current_run
+
+    # -- worker-side helpers ------------------------------------------------
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """The cooperative-cancel event the orchestrator polls. Worker-side."""
+        return self._cancel_event
+
+    def _set_current_run(self, run_handle: "RunHandle | None") -> None:
+        """Point :attr:`current_run` at *run_handle* and emit ``currentRunChanged``.
+
+        Called by the controller (on its ``runStarted`` signal) while an
+        orchestrator is active, so the orchestrator handle always references
+        the acquisition currently in flight. Idempotent for repeat handles.
+        """
+        with self._lock:
+            if run_handle is self._current_run:
+                return
+            self._current_run = run_handle
+        self.currentRunChanged.emit(run_handle)
+
+    def update(self, **updates: Any) -> OrchestratorStatus:
+        """Atomically apply ``updates`` to the status snapshot and emit."""
+        with self._lock:
+            self._status = replace(self._status, **updates)
+            new_status = self._status
+        self.statusChanged.emit(new_status)
+        return new_status
+
+    def report_progress(
+        self, step: int, n_steps: int, message: str | None = None
+    ) -> OrchestratorStatus:
+        """Convenience for orchestrators: set the step counter (+ message).
+
+        Equivalent to ``update(step=step, n_steps=n_steps, message=...)`` but
+        reads clearly at the call site (e.g. ``progress.report_progress(i,
+        n, f"phase {i + 1}/{n}")``). Does not touch ``state`` — the controller
+        owns the running/done/error lifecycle.
+        """
+        return self.update(step=step, n_steps=n_steps, message=message)
