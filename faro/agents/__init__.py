@@ -10,7 +10,13 @@ from faro.agents.bo_oscillation import OscillationBO
 from faro.agents.composed import ComposedAgent
 from faro.agents.condition_monitor import ConditionMonitorAgent
 from faro.agents.fov_condition_monitor import FOVConditionMonitorAgent
+from faro.agents.fov_density import (
+    FovDensityScorer,
+    build_stage_montage,
+    find_fov_windows,
+)
 from faro.agents.fov_finder import FOVCondition, FOVFinderAgent
+from faro.agents.grid_fov_finder import GridFOVFinderAgent
 from faro.agents.well_pattern import (
     FOVFinder,
     ResolvedWellPatterns,
@@ -38,8 +44,12 @@ __all__ = [
     "FOVConditionMonitorAgent",
     "FOVFinder",
     "FOVFinderAgent",
+    "FovDensityScorer",
+    "GridFOVFinderAgent",
     "IntraExperimentAgent",
     "InterPhaseAgent",
+    "build_stage_montage",
+    "find_fov_windows",
     "OscillationBO",
     "OscillationBOBoTorch",
     "PreExperimentAgent",

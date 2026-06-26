@@ -33,6 +33,7 @@ test = [
     # one (trackpy is a core dep).
     "faro[motile]",
     "nbformat",
+    "nbconvert",
 ]
 
 motile = [
