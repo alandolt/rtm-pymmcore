@@ -1,4 +1,5 @@
 import inspect
+import warnings
 
 import numpy as np
 from skimage.measure import label
@@ -38,13 +39,25 @@ def remove_small_objects(label_image, min_size, connectivity=1):
     reproduces the original "area < min_size" threshold exactly, so every
     backend keeps identical behaviour on either version.
     """
-    if _RSO_ACCEPTS_MAX_SIZE:
-        return _sk_remove_small_objects(
-            label_image, max_size=min_size - 1, connectivity=connectivity
+    # ``label_image`` is a genuine labeled int array (0 = background, 1..N =
+    # objects). When a frame contains only one object, skimage sees a single
+    # label and emits "Only one label was provided ... Did you mean to use a
+    # boolean array?" — a false positive here (sparse FOVs in the FOV-finder
+    # scan hit it constantly). Silence just that warning; keep everything else.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Only one label was provided",
+            category=UserWarning,
+            module=r"skimage\..*",
         )
-    return _sk_remove_small_objects(
-        label_image, min_size=min_size, connectivity=connectivity
-    )
+        if _RSO_ACCEPTS_MAX_SIZE:
+            return _sk_remove_small_objects(
+                label_image, max_size=min_size - 1, connectivity=connectivity
+            )
+        return _sk_remove_small_objects(
+            label_image, min_size=min_size, connectivity=connectivity
+        )
 
 
 class Segmentator:
@@ -88,7 +101,8 @@ class DummySegmentator(Segmentator):
 
     def segment(self, image: np.ndarray) -> np.ndarray:
         return np.ones_like(image)
-    
+
+
 class OtsuSegmentator(Segmentator):
     """
     Otsu segmentator.
@@ -107,5 +121,3 @@ class OtsuSegmentator(Segmentator):
         binary_image = image_gaussian > thresh
         label_image = label(binary_image)
         return label_image
-    
-
