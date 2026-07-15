@@ -462,6 +462,7 @@ def find_fov_windows(
     recenter_iters: int = 3,
     min_separation_um: float | None = None,
     fill_invalid: bool = False,
+    fill_prefers_conditions: bool = True,
     candidate_centers: np.ndarray | None = None,
     feat: dict[str, np.ndarray] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -497,6 +498,15 @@ def find_fov_windows(
             empty far corner.  Use this when a downstream agent needs exactly
             ``n_select`` FOVs.  When ``False`` the result may contain fewer
             than ``n_select`` (and you avoid imaging junk fields entirely).
+        fill_prefers_conditions: When topping up invalid windows (see
+            *fill_invalid*) and the *scorer* carries ``fov_conditions``, rank the
+            fill by ``(cell-count band, feature gate, density score)`` — i.e.
+            put the feature gate (e.g. ERK CNR) **above clumping** but keep the
+            cell-count band on top.  So an ERK-ready field that was rejected only
+            for being *too clumped* beats a clean but ERK-dead one, while a field
+            that fails ``min_cells`` / ``max_cells`` is still not preferred.
+            ``True`` (default) is a no-op without ``fov_conditions``; set
+            ``False`` to rank the fill purely by density score.
         candidate_centers: ``(K, 2)`` seed centres to evaluate.  Defaults to
             the cell positions themselves (so every cluster is a candidate).
         feat: Optional ``{feature_name: (N,) array}`` of per-cell features
@@ -594,13 +604,31 @@ def find_fov_windows(
         mode="spread",
     )
     if fill_invalid and len(selected) < n_select:
-        invalid_order = sorted(
-            df_all.index[~df_all["valid"]].tolist(),
-            key=lambda i: -float(df_all.at[i, "score"]),
-        )
-        # Fills pick the *best available* leftover window (most cells, least
-        # clumped) rather than the farthest — a denser nearby FOV beats an
-        # empty far corner.
+        invalid_idx = df_all.index[~df_all["valid"]].tolist()
+        if fill_prefers_conditions and "conditions_pass" in df_all.columns:
+            # Fill priority: (cell-count band, feature gate, density score).
+            # Cell count keeps top priority, then the feature gate (e.g. ERK CNR)
+            # ranks ABOVE clumping (clumping only enters via the score), so an
+            # ERK-ready but clumped field beats a clean but ERK-dead one while a
+            # field outside the cell-count band is still not preferred.
+            def _fill_key(i: int) -> tuple[bool, bool, float]:
+                n = float(df_all.at[i, "n_cells"])
+                count_ok = n >= scorer.min_cells and (
+                    scorer.max_cells is None or n <= scorer.max_cells
+                )
+                return (
+                    count_ok,
+                    bool(df_all.at[i, "conditions_pass"]),
+                    float(df_all.at[i, "score"]),
+                )
+
+            invalid_order = sorted(invalid_idx, key=_fill_key, reverse=True)
+        else:
+            invalid_order = sorted(
+                invalid_idx, key=lambda i: -float(df_all.at[i, "score"])
+            )
+        # Fills pick the *best available* leftover window rather than the
+        # farthest — a good nearby FOV beats an empty far corner.
         _select_nonoverlapping(
             df_all,
             invalid_order,

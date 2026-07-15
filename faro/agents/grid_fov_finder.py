@@ -101,13 +101,31 @@ class GridFOVFinderAgent(PreExperimentAgent):
             ``clump_distance_um`` / ``min_nn_um`` / ``max_nn_um`` instead.
         recenter / recenter_iters: Mean-shift the chosen windows onto their
             local cluster (the "move the FOV onto the nice cells" behaviour).
-        min_separation_um: Minimum spacing between selected FOVs (``None`` ->
-            ~one FOV side, i.e. non-overlapping).
+        min_separation_um: Minimum *center-to-center* spacing between selected
+            FOVs (``None`` -> ~one FOV side, i.e. merely non-overlapping /
+            edge-to-edge).  NOTE: non-overlap already forces the centers at
+            least one FOV-width apart along the separating axis, so any value
+            **smaller than one FOV width has no effect** — to open a real gap
+            you must exceed the FOV size.  Because the FOV size is only known at
+            run time, prefer ``min_separation_factor`` to express the gap.
+        min_separation_factor: Minimum spacing as a **multiple of the (larger)
+            FOV side**, resolved against the run-time FOV size.  ``1.0`` =
+            edge-to-edge (same as non-overlap along-axis); ``1.2`` leaves a
+            ~20%-of-a-FOV gap; etc.  Combined with ``min_separation_um`` by
+            taking the larger of the two.  ``None`` (default) disables it.
         flip_x / flip_y: Camera→stage axis flips (see module caveat).
         strict_count: If ``True`` (default), always return exactly
             ``fovs_per_well`` per well, padding with the best-scoring windows
             even if they failed the density filter (downstream agents such as
             OscillationBO expect a fixed count).
+        fill_prefers_conditions: When ``strict_count`` has to pad from rejected
+            windows, rank the fill by ``(cell-count band, feature gate, density
+            score)`` so the feature condition (e.g. ERK ``cnr``) outranks
+            **clumping** while the cell-count band stays on top: an ERK-ready but
+            clumped field is padded in before a clean but ERK-dead one, yet a
+            field outside ``min_cells`` / ``max_cells`` is not. ``True``
+            (default) is a no-op without ``fov_conditions``; ``False`` pads
+            purely by density score (the old behaviour).
         store_tiles: If ``True``, keep each well's raw segmentation-channel
             grid tiles on ``last_run["tile_images_by_well"]`` so the scan can
             be stitched into a stage-coordinate montage (via
@@ -138,6 +156,7 @@ class GridFOVFinderAgent(PreExperimentAgent):
         recenter: bool = True,
         recenter_iters: int = 3,
         min_separation_um: float | None = None,
+        min_separation_factor: float | None = None,
         imaging_channels: tuple[Channel, ...],
         segmentator: Segmentator,
         seg_channel_index: int = 0,
@@ -149,6 +168,7 @@ class GridFOVFinderAgent(PreExperimentAgent):
         random_seed: int | None = None,
         name_prefix: str = "fov",
         strict_count: bool = True,
+        fill_prefers_conditions: bool = True,
         return_json: bool | None = None,
         cycle_wells: bool = False,
         store_tiles: bool = False,
@@ -195,7 +215,12 @@ class GridFOVFinderAgent(PreExperimentAgent):
         self.max_nn_um = None if max_nn_um is None else float(max_nn_um)
         self.recenter = bool(recenter)
         self.recenter_iters = int(recenter_iters)
+        if min_separation_factor is not None and min_separation_factor <= 0:
+            raise ValueError("min_separation_factor must be positive")
         self.min_separation_um = min_separation_um
+        self.min_separation_factor = (
+            None if min_separation_factor is None else float(min_separation_factor)
+        )
         self.imaging_channels = tuple(imaging_channels)
         self.segmentator = segmentator
         self.seg_channel_index = int(seg_channel_index)
@@ -207,6 +232,7 @@ class GridFOVFinderAgent(PreExperimentAgent):
         self.random_seed = random_seed
         self.name_prefix = name_prefix
         self.strict_count = bool(strict_count)
+        self.fill_prefers_conditions = bool(fill_prefers_conditions)
         self.return_json = bool(return_json) if return_json is not None else False
         self.cycle_wells = bool(cycle_wells)
         self.store_tiles = bool(store_tiles)
@@ -460,12 +486,25 @@ class GridFOVFinderAgent(PreExperimentAgent):
         z_value = self.microscope.get_focus() if self.z == "current" else self.z
         pixel_size_um, fov_w_um, fov_h_um = self._resolve_fov_geometry()
 
+        # Resolve the center-to-center separation now that the FOV size is
+        # known. min_separation_factor is expressed in FOV-sides (the larger
+        # side, so it is conservative for non-square FOVs); we take the larger
+        # of the factor- and absolute-µm requests. Recall that non-overlap
+        # alone already implies ~1 FOV of along-axis spacing, so a factor of
+        # 1.0 is a no-op and >1.0 is what actually opens a gap.
+        min_separation_um = self.min_separation_um
+        if self.min_separation_factor is not None:
+            sep_from_factor = self.min_separation_factor * max(fov_w_um, fov_h_um)
+            min_separation_um = max(min_separation_um or 0.0, sep_from_factor)
+
         wells = self.pick_next_wells()
         if self.verbose:
             print(
                 f"[GridFOVFinderAgent] Phase {phase}: {self.grid_rows}x"
                 f"{self.grid_cols} grid scan in {len(wells)} well(s): {wells} "
-                f"(fov={fov_w_um:.0f}x{fov_h_um:.0f} µm, px={pixel_size_um:.3f})"
+                f"(fov={fov_w_um:.0f}x{fov_h_um:.0f} µm, px={pixel_size_um:.3f}"
+                + (f", min_sep={min_separation_um:.0f} µm" if min_separation_um else "")
+                + ")"
             )
 
         scorer = FovDensityScorer(
@@ -505,10 +544,12 @@ class GridFOVFinderAgent(PreExperimentAgent):
                 n_select=self.fovs_per_well,
                 recenter=self.recenter,
                 recenter_iters=self.recenter_iters,
-                min_separation_um=self.min_separation_um,
+                min_separation_um=min_separation_um,
                 # strict_count -> top up to fovs_per_well from the best
                 # below-threshold windows, but still non-overlapping & spread.
                 fill_invalid=self.strict_count,
+                # ERK/feature gate ranks above clumping when padding (count stays on top).
+                fill_prefers_conditions=self.fill_prefers_conditions,
                 feat=feat,  # per-cell ERK features -> gate windows on activity
             )
             candidates_by_well[well] = df_all

@@ -325,6 +325,94 @@ def test_find_fov_windows_feature_condition_gate():
     assert (df_sel["x"].abs() < 300).all()
 
 
+def test_fill_prefers_feature_gate_over_clumping():
+    # No fully-valid window: the ERK-ready cluster is too clumped, the clean
+    # cluster is ERK-dead. With fill_prefers_conditions the pad must take the
+    # ERK-ready (feature-passing) field even though it failed the clumping gate;
+    # ranked purely by density it would instead grab the clean ERK-dead one.
+    from faro.agents.fov_finder import FOVCondition
+
+    rng = np.random.default_rng(5)
+    ready_clumped = rng.normal([0.0, 0.0], 3.0, size=(40, 2))  # CNR ok, clumped
+    gx, gy = np.meshgrid(np.arange(6) * 40.0, np.arange(6) * 40.0)
+    clean_dead = np.column_stack([gx.ravel() + 5000.0, gy.ravel()])  # spread, CNR bad
+    xy = np.vstack([ready_clumped, clean_dead])
+    feat = {"cnr": np.concatenate([np.full(40, 0.5), np.full(len(clean_dead), 2.0)])}
+
+    cond = FOVCondition("cnr", "below", 1.0, min_fraction=0.7)
+    scorer = FovDensityScorer(
+        fov_w_um=400,
+        fov_h_um=400,
+        min_cells=10,
+        max_cells=200,
+        clump_distance_um=20.0,
+        max_clumped_fraction=0.3,
+        fov_conditions=[cond],
+    )
+    # Neither cluster is fully valid (one too clumped, the other ERK-dead).
+    df_all, _ = find_fov_windows(xy, scorer, n_select=1, feat=feat, fill_invalid=False)
+    assert not df_all["valid"].any()
+
+    # Feature gate ranks above clumping -> ERK-ready clumped cluster (near origin).
+    _, sel_pref = find_fov_windows(
+        xy,
+        scorer,
+        n_select=1,
+        feat=feat,
+        fill_invalid=True,
+        fill_prefers_conditions=True,
+    )
+    assert len(sel_pref) == 1
+    assert abs(sel_pref.iloc[0]["x"]) < 400
+    assert bool(sel_pref.iloc[0]["conditions_pass"])
+
+    # Density-only fill -> the clean but ERK-dead cluster (near x=5000).
+    _, sel_score = find_fov_windows(
+        xy,
+        scorer,
+        n_select=1,
+        feat=feat,
+        fill_invalid=True,
+        fill_prefers_conditions=False,
+    )
+    assert abs(sel_score.iloc[0]["x"] - 5000) < 400
+    assert not bool(sel_score.iloc[0]["conditions_pass"])
+
+
+def test_fill_keeps_cell_count_above_feature_gate():
+    # Cell count stays TOP priority: an ERK-ready field that fails the count band
+    # (too few cells) must NOT be padded in ahead of a count-valid ERK-dead one.
+    from faro.agents.fov_finder import FOVCondition
+
+    rng = np.random.default_rng(8)
+    ready_sparse = rng.normal([0.0, 0.0], 60.0, size=(6, 2))  # CNR ok, too few cells
+    gx, gy = np.meshgrid(np.arange(6) * 40.0, np.arange(6) * 40.0)
+    dead_ok = np.column_stack([gx.ravel() + 5000.0, gy.ravel()])  # count ok, CNR bad
+    xy = np.vstack([ready_sparse, dead_ok])
+    feat = {"cnr": np.concatenate([np.full(6, 0.5), np.full(len(dead_ok), 2.0)])}
+
+    cond = FOVCondition("cnr", "below", 1.0, min_fraction=0.7)
+    scorer = FovDensityScorer(
+        fov_w_um=400,
+        fov_h_um=400,
+        min_cells=20,  # ready_sparse (6 cells) fails this; dead_ok (36) passes
+        max_cells=200,
+        clump_distance_um=10.0,
+        max_clumped_fraction=0.6,
+        fov_conditions=[cond],
+    )
+    _, sel = find_fov_windows(
+        xy,
+        scorer,
+        n_select=1,
+        feat=feat,
+        fill_invalid=True,
+        fill_prefers_conditions=True,
+    )
+    # count-valid ERK-dead field wins over count-failing ERK-ready field.
+    assert abs(sel.iloc[0]["x"] - 5000) < 400
+
+
 def test_find_fov_windows_no_conditions_unchanged():
     """Without conditions the feat path is inert (backward compatible)."""
     xy = np.random.default_rng(1).normal([0.0, 0.0], 100.0, size=(50, 2))
