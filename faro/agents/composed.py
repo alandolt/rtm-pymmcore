@@ -160,7 +160,12 @@ class ComposedAgent(InterPhaseAgent):
                 "Controller(mic, pipeline, agent=composed_agent) first."
             )
 
-        for phase in range(self.n_phases):
+        # A ``while`` loop (not ``for range(...)``) so ``self.n_phases`` is read
+        # afresh each iteration: it can be raised LIVE mid-run (e.g. from another
+        # cell during an async run) to append phases, picked up at the next phase
+        # boundary. Lowering it at/below the current phase also stops cleanly.
+        phase = 0
+        while phase < self.n_phases:
             if progress is not None and progress.cancelled:
                 print(
                     f"[ComposedAgent] cancelled before phase {phase + 1}/"
@@ -204,6 +209,7 @@ class ComposedAgent(InterPhaseAgent):
                     "inner_result": inner_result,
                 }
             )
+            phase += 1
 
         if self.finish_experiment and self.controller is not None:
             self.controller.finish_experiment()
