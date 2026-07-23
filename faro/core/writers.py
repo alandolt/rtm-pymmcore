@@ -73,6 +73,20 @@ class Writer(Protocol):
         """
         ...
 
+    def read_ref(self, metadata: dict) -> np.ndarray:
+        """Read back a previously written reference frame as ``(c, y, x)``.
+
+        Companion to :meth:`read_raw` for the deferred-pipeline path. A ref
+        frame is stored split: its imaging slice goes to ``"raw"`` and its ref
+        slice to ``"ref"`` (see the Analyzer's storage split), so reloading a
+        deferred ref frame needs both halves — ``read_raw`` for the imaging
+        channels and this for the ref channels.
+
+        Args:
+            metadata: Event metadata (must contain 'fname', 'fov', 'timestep').
+        """
+        ...
+
     def save_events(self, events) -> None:
         """Save acquisition events as ``events.json`` in the storage path."""
         ...
@@ -118,6 +132,12 @@ class TiffWriter:
         fname = metadata["fname"]
         return tifffile.imread(
             os.path.join(self.storage_path, "raw", fname + ".tiff")
+        )
+
+    def read_ref(self, metadata: dict) -> np.ndarray:
+        fname = metadata["fname"]
+        return tifffile.imread(
+            os.path.join(self.storage_path, "ref", fname + ".tiff")
         )
 
     def save_events(self, events) -> None:
@@ -719,6 +739,14 @@ class OmeZarrWriter:
             else:
                 frame = np.asarray(self._read_raw_from_disk(metadata))
         return self._strip_stim_channels(frame)
+
+    def read_ref(self, metadata: dict) -> np.ndarray:
+        """Read back a ref frame ``(c, y, x)``.
+
+        Ref frames are stored as TIFF (``write(img, metadata, "ref")`` routes
+        to the internal :class:`TiffWriter`), so read-back delegates there too.
+        """
+        return self._tiff.read_ref(metadata)
 
     def _read_raw_from_disk(self, metadata: dict) -> np.ndarray:
         """Read a raw frame from the on-disk store. ``(c, y, x)``, stim kept.

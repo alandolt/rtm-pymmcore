@@ -498,6 +498,23 @@ class Analyzer:
                 # correct across backends.
                 try:
                     img = self.writer.read_raw(metadata)
+                    # read_raw returns the imaging channels only. An IMG_REF
+                    # frame's ref slice was stored separately (see _do_store),
+                    # so reload it and restore the full [imaging | ref] stack the
+                    # pipeline expects — otherwise the ref feature extractor gets
+                    # an imaging-only image and cannot isolate the ref channel
+                    # (the deterministic "ref channel not isolated" skip / the
+                    # earlier RefFE shape crash under pipeline overload).
+                    if (
+                        metadata.get("img_type") == ImgType.IMG_REF
+                        and len(metadata.get("ref_channels", ())) > 0
+                    ):
+                        ref = self.writer.read_ref(metadata)
+                        if img.ndim == 2:
+                            img = img[np.newaxis]
+                        if ref.ndim == 2:
+                            ref = ref[np.newaxis]
+                        img = np.concatenate([img, ref], axis=0)
                 except Exception as e:
                     with self.task_lock:
                         self.active_pipeline_tasks -= 1

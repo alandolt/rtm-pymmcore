@@ -503,7 +503,24 @@ class ImageProcessingPipeline:
             )
 
             if metadata.get("img_type") == ImgType.IMG_REF:
-                if (
+                if img_ref is None:
+                    # The ref channel could not be isolated from the stack (the
+                    # [imaging | ref] split above did not fire — e.g. a
+                    # mis-buffered/short frame stack). Do NOT fall back to the
+                    # multi-channel imaging ``img``: that handed RefFE a (C,H,W)
+                    # intensity image against a 2-D label and raised "Label and
+                    # intensity image shapes must match". Skip ref extraction
+                    # for this frame and say so instead of corrupting or
+                    # crashing.
+                    print(
+                        f"[Pipeline] IMG_REF frame fov={metadata.get('fov')} "
+                        f"t={metadata.get('timestep')}: ref channel not isolated "
+                        f"(img.shape={getattr(img, 'shape', None)}, "
+                        f"n_channels={len(metadata.get('channels', ()))}, "
+                        f"n_ref={len(metadata.get('ref_channels', ()))}); "
+                        "skipping ref feature extraction for this frame."
+                    )
+                elif (
                     self.feature_extractor_ref is not None
                     and self.tracker is not None
                     and not df_tracked.empty
@@ -511,7 +528,7 @@ class ImageProcessingPipeline:
                 ):
                     df_tracked = self.feature_extractor_ref.extract_features(
                         segmentation_results,
-                        img_ref if img_ref is not None else img,
+                        img_ref,
                         df_tracked,
                         metadata,
                     )

@@ -15,7 +15,18 @@ class RefFE(FeatureExtractorRef):
         tracked_label = labels_to_particles(
             segmentation_results[self.used_mask], df_tracked
         )
-        tracked_label = np.expand_dims(tracked_label, 0)
+        # The ref acquisition is single-channel, so reduce the intensity image
+        # to a single 2-D plane aligned with the 2-D label rather than assuming
+        # it is exactly (1, H, W). A leading channel axis — or, defensively, a
+        # multi-plane stack that slipped through upstream — is collapsed to its
+        # first plane. The previous ``np.expand_dims(label, 0)`` required the
+        # intensity image to match (1, H, W) exactly, so regionprops raised
+        # "Label and intensity image shapes must match" on any channel-count
+        # drift (e.g. when a mis-buffered frame handed RefFE the 2-channel
+        # imaging stack).
+        image = np.asarray(image)
+        while image.ndim > tracked_label.ndim:
+            image = image[0]
         table = skimage.measure.regionprops_table(
             tracked_label, image, properties=["label", "mean_intensity"]
         )
