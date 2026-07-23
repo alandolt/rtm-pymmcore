@@ -732,7 +732,10 @@ class Controller:
         self._queue: Queue = Queue()
         self._analyzer: Analyzer | None = None
         self._n_channels: int = 1
-        self._frame_buffers: dict[tuple, list] = {}
+        # Keyed by (t, p); value is {channel_index c -> (img, event)} so a
+        # frame is placed by its channel index rather than arrival order (see
+        # _on_frame_ready).
+        self._frame_buffers: dict[tuple, dict] = {}
 
         # Continuation state
         self._t_offset: int = 0
@@ -1103,6 +1106,15 @@ class Controller:
                 self._all_events.clear()
                 self._fov_positions.clear()
                 self._frame_buffers.clear()
+
+                # Let the microscope finalize the experiment now that the
+                # run is done and the Analyzer is drained (e.g. Niesen stops
+                # its laser keepalive). Guarded so a hardware-hook failure
+                # can't break experiment teardown.
+                try:
+                    self._mic.post_experiment()
+                except Exception:
+                    pass
             except BaseException as exc:
                 box.append(exc)
             finally:
@@ -1211,6 +1223,12 @@ class Controller:
             mmc.stopSequenceAcquisition()
 
         self._mic.connect_frame(self._on_frame_ready)
+
+        # Start each batch with empty frame buffers. Buffers are keyed by
+        # (t, p); across batches with fresh FOVs (offset_timepoints=False) the
+        # (t, p) keys can repeat, so a partial buffer orphaned in the previous
+        # batch must not linger and get merged into a new batch's frames.
+        self._frame_buffers.clear()
 
         # Recreate the engine queue for this run. The finally-block below
         # puts a STOP_EVENT sentinel into self._queue to stop the engine;
@@ -1513,25 +1531,46 @@ class Controller:
         # timepoint.  The expected count is derived from event metadata so it
         # is correct even when ref_channels vary across timepoints.
         tp = (event.index.get("t", 0), event.index.get("p", 0))
-        buf = self._frame_buffers.setdefault(tp, [])
-        if buf and buf[0].shape[-2:] != img.shape[-2:]:
-            # Channels at the same (t, p) came back at different sizes —
-            # almost always a sticky camera binning or ROI property.
-            self._abort_mda_from_callback(
-                f"Frame shape mismatch: channel {tuple(img.shape[-2:])} vs "
-                f"previous {tuple(buf[0].shape[-2:])} at index={dict(event.index)}. "
-                "Sticky camera Binning/ROI?"
-            )
-            return
-        buf.append(img)
+        c = event.index.get("c", 0)
+        buf = self._frame_buffers.setdefault(tp, {})
+        if buf:
+            prev_img = next(iter(buf.values()))[0]
+            if prev_img.shape[-2:] != img.shape[-2:]:
+                # Channels at the same (t, p) came back at different sizes —
+                # almost always a sticky camera binning or ROI property.
+                self._abort_mda_from_callback(
+                    f"Frame shape mismatch: channel {tuple(img.shape[-2:])} vs "
+                    f"previous {tuple(prev_img.shape[-2:])} at index={dict(event.index)}. "
+                    "Sticky camera Binning/ROI?"
+                )
+                return
+        # Key each frame by its channel index ``c``, NOT arrival order. A frame
+        # re-delivered or reordered by the acquisition engine (e.g. Niesen's
+        # per-frame DMD/SLM injection fragments the hardware-sequenced channel
+        # burst) then overwrites its own slot instead of appending a duplicate,
+        # and the stack below is assembled in channel order. Downstream the
+        # pipeline splits the stack positionally ([imaging | ref] via
+        # img[:n_channels] / img[n_channels:]); with arrival-order buffering an
+        # out-of-order or duplicated frame silently broke that split and handed
+        # RefFE a multi-channel intensity image -> regionprops shape error.
+        buf[c] = (img, event)
 
         n_expected = len(event.metadata.get("channels", ()))
         n_expected += len(event.metadata.get("ref_channels", ()))
 
-        if len(buf) >= n_expected:
-            frame = np.stack(buf, axis=0)
+        # Submit only once every expected channel index (0 .. n_expected-1) has
+        # arrived — imaging channels are c=0..n_channels-1 and ref channels the
+        # next indices, so this is exactly range(n_expected).
+        if n_expected and all(k in buf for k in range(n_expected)):
             del self._frame_buffers[tp]
-            self._analyzer.run(frame, event)
+            ordered = [buf[k] for k in range(n_expected)]
+            frame = np.stack([im for im, _ev in ordered], axis=0)
+            self._evict_stale_buffers(tp)
+            # Representative event = highest channel index (deterministic, not
+            # arrival-dependent). On a ref timepoint that is the IMG_REF
+            # ref-channel event so ref extraction runs; on a plain imaging
+            # timepoint it is the last imaging channel (IMG_RAW).
+            self._analyzer.run(frame, ordered[-1][1])
 
     def _abort_mda_from_callback(self, message: str) -> None:
         """Stash a fatal error and cancel the MDA from a psygnal callback.
@@ -1546,6 +1585,32 @@ class Controller:
             self._mic.cancel_mda()
         except Exception:
             traceback.print_exc()
+
+    def _evict_stale_buffers(self, completed_tp) -> None:
+        """Drop orphaned partial frame buffers once a later timepoint at the
+        same position has completed.
+
+        Frames for a position arrive with monotonically increasing ``t`` within
+        a run (``continue_experiment`` offsets timepoints), so when ``(t, p)``
+        completes, any still-incomplete ``(t' < t, p)`` missed a frame and will
+        never complete. Evicting it — and logging which channels did arrive —
+        stops the buffer dict from leaking and surfaces the dropped frame
+        instead of hiding it as silently missing data.
+        """
+        t_done, p = completed_tp
+        stale = [
+            key
+            for key in self._frame_buffers
+            if key[1] == p and key[0] < t_done
+        ]
+        for key in stale:
+            planes = sorted(self._frame_buffers[key])
+            del self._frame_buffers[key]
+            print(
+                f"[Controller] Dropping incomplete frame buffer at tp={key}: "
+                f"only channel(s) {planes} arrived before tp={completed_tp} "
+                "completed - a frame was lost; that timepoint is not analyzed."
+            )
 
     # ------------------------------------------------------------------
     # Stim helpers
@@ -1631,16 +1696,24 @@ class ControllerSimulated(Controller):
         if img_type == ImgType.IMG_STIM:
             return  # Stim images are not processed in this simulation
 
-        # Buffer by (t, p), submit when all channels received
+        # Buffer by (t, p) keyed on channel index c (mirrors the live
+        # controller); submit once every channel has arrived.
         tp = (event.index.get("t", 0), event.index.get("p", 0))
-        buf = self._frame_buffers.setdefault(tp, [])
-        buf.append(img)
+        c = event.index.get("c", 0)
+        buf = self._frame_buffers.setdefault(tp, {})
+        buf[c] = (img, event)
 
         n_expected = len(meta.get("channels", ()))
         n_expected += len(meta.get("ref_channels", ()))
 
-        if len(buf) >= n_expected:
+        if n_expected and all(k in buf for k in range(n_expected)):
             del self._frame_buffers[tp]
+            # Highest channel index is the representative event (ref-last), so
+            # ref timepoints load from ref/ and imaging timepoints from
+            # raw/zarr.
+            event = buf[n_expected - 1][1]
+            meta = event.metadata or {}
+            img_type = meta.get("img_type", ImgType.IMG_RAW)
             fname = meta["fname"]
             t_idx = event.index.get("t", 0)
             p_idx = event.index.get("p", 0)
