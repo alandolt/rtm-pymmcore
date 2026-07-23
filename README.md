@@ -53,6 +53,33 @@ handle = ctrl.run_experiment(list(events), stim_mode="current")
 handle.wait()  # run_experiment is non-blocking; wait() blocks until done
 ```
 
+## GUI: napari-micromanager on a faro scope
+
+`python -m napari_micromanager -c some.cfg` only loads a Micro-Manager cfg, which
+can't express the Python-side setup several scopes need (DMD blanking/hold,
+ROI-follows-binning, laser keepalive, the per-scope MDA engine). `faro-napari`
+builds the microscope class first, then hands its configured core to the plugin:
+
+```bash
+uv run faro-napari --list          # registered scopes
+uv run faro-napari moench
+uv run faro-napari niesen-nolaser
+uv run faro-napari demo            # MM demo config, no hardware
+```
+
+Any microscope class works, registered or not:
+
+```bash
+uv run faro-napari faro.microscope.pertzlab.niesen:Niesen --kwarg fast_init=True
+uv run faro-napari moench --affine E:/calib/affine.npy --config E:/alt/TiMoench.cfg
+```
+
+The plugin drives the core without owning it, so faro's MDA engine stays
+registered and teardown remains the microscope's job. `mic`, `mmcore` and
+`viewer` are pushed into the napari console, so e.g.
+`mic.calibrate_dmd(CyanStim)` can be run interactively. See
+[faro/napari_launcher.py](faro/napari_launcher.py).
+
 ## Pipeline
 
 The pipeline is modular, each component is independent and can be swapped or set to `None`.

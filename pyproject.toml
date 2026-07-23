@@ -16,6 +16,10 @@ dependencies = [
     "tifffile",
     "pymmcore-plus>=0.17.3",
     "pymmcore-widgets",
+<<<<<<< Updated upstream
+=======
+    "pymmcore",
+>>>>>>> Stashed changes
     "trackpy",
     "napari-micromanager",
     "pymmcore-widgets",
@@ -23,6 +27,13 @@ dependencies = [
     "napari-ome-zarr",
     "zarr>=3",
 ]
+
+[project.scripts]
+# Launch napari-micromanager on a faro microscope class (see
+# faro/napari_launcher.py) so the Python-side setup a .cfg can't express --
+# DMD blanking/hold, ROI-follows-binning, laser keepalive, per-scope MDA
+# engine -- is applied before the GUI attaches to the core.
+faro-napari = "faro.napari_launcher:main"
 
 [project.optional-dependencies]
 
